@@ -33,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -U seleniumbase requests pyvirtualdisplay
           sudo apt-get update -qq
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb xdotool
           seleniumbase install chromedriver
           seleniumbase install chrome
           echo "✅ 依赖安装完成"
