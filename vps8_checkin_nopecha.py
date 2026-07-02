@@ -2,7 +2,9 @@ import os
 import re
 import sys
 import time
+import random
 import platform
+import subprocess
 import traceback
 import requests
 
@@ -16,27 +18,36 @@ LOGIN_URL  = os.getenv("LOGIN_URL", f"{BASE_URL}/login")
 SIGNIN_URL = os.getenv("SIGNIN_URL", f"{BASE_URL}/points/signin")
 
 # 第三方登录方式: github / google / nodeloc
-LOGIN_PROVIDER = os.getenv("LOGIN_PROVIDER", "github").strip().lower()
+LOGIN_PROVIDER = os.getenv("LOGIN_PROVIDER", "nodeloc").strip().lower()
 PROVIDER_LOGIN_URLS = {
     "github":  f"{BASE_URL}/github/login",
     "google":  f"{BASE_URL}/google/login",
     "nodeloc": f"{BASE_URL}/nodeloc/login",
 }
 
-# 持久化 Chrome Profile —— 保存第三方登录态，避免每次重新登录
+# 持久化 Chrome Profile —— 复用同一份（含第三方登录态 + Discord 登录态 + NopeCHA）
 PROFILE_DIR = os.getenv(
     "BROWSER_USER_DATA_DIR",
-    os.path.expanduser("~/.chrome-profile-vps8"),
+    os.path.expanduser("~/.chrome-profile-discord"),
 )
 
 # NopeCHA 插件目录（解压后的扩展文件夹，含 manifest.json）
-# 默认取脚本同目录下的 chromium/ 文件夹（与第二个脚本一致）
 NOPECHA_EXT_DIR = os.getenv(
     "NOPECHA_EXT_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium"),
 )
-# NopeCHA 套餐 key（可选）。设置后会通过 nopecha.com/setup#<key> 激活插件额度
+# NopeCHA 套餐 key（可选）。设置后直接注入并跳过 Discord 领取流程
 NOPECHA_KEY = (os.getenv("NOPECHA_KEY") or "").strip()
+
+# NopeCHA 官方 Discord —— 用于自动领取每日 CDK（激活码）
+DISCORD_CHANNEL_URL = os.getenv(
+    "DISCORD_CHANNEL_URL",
+    "https://discord.com/channels/1046086326077882479/1243188924520726538",
+)
+DISCORD_DM_URL = os.getenv(
+    "DISCORD_DM_URL",
+    "https://discord.com/channels/@me/1519516877074731018",
+)
 
 SS_DIR = os.getenv("SS_DIR", "screenshots")
 IP_CHECK_URL = os.getenv("IP_CHECK_URL", "https://api.ipify.org?format=json")
@@ -49,6 +60,7 @@ BROWSER_IP_PROBE_URLS = [
 PROXY = (os.getenv("PROXY") or os.getenv("BROWSER_PROXY") or "").strip()
 TG_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+DISPLAY = os.environ.get("DISPLAY", ":99")
 # ===========================================
 
 
@@ -174,6 +186,201 @@ def finish(sb, name, caption):
         send_tg_photo(TG_TOKEN, TG_CHAT_ID, img, caption)
 
 
+# ── JS / xdotool 辅助（操作 Discord 输入框需要）────────────
+
+def js_eval(sb, expr):
+    try:
+        return sb.execute_script(f"return ({expr})")
+    except Exception as e:
+        log("WARN", f"js_eval 失败: {e}")
+        return None
+
+
+def xdo(args):
+    env = {**os.environ, "DISPLAY": DISPLAY}
+    subprocess.run(["xdotool"] + args, env=env, capture_output=True, check=False)
+
+
+def mouse_click(x, y, label=""):
+    mid_x = x + random.randint(-30, 30)
+    mid_y = y + random.randint(-20, 20)
+    xdo(["mousemove", "--", str(mid_x), str(mid_y)])
+    time.sleep(random.uniform(0.1, 0.2))
+    xdo(["mousemove", "--", str(x), str(y)])
+    time.sleep(random.uniform(0.1, 0.25))
+    xdo(["mousedown", "1"])
+    time.sleep(random.uniform(0.08, 0.15))
+    xdo(["mouseup", "1"])
+    if label:
+        log("INFO", f"  🖱️ 点击 ({x},{y}) {label}")
+
+
+def keyboard_type(text):
+    env = {**os.environ, "DISPLAY": DISPLAY}
+    for ch in text:
+        subprocess.run(
+            ["xdotool", "type", "--clearmodifiers", "--delay", "80", "--", ch],
+            env=env, capture_output=True,
+        )
+        time.sleep(random.uniform(0.05, 0.15))
+
+
+def keyboard_key(key):
+    xdo(["key", "--clearmodifiers", key])
+    time.sleep(0.1)
+
+
+def get_element_screen_pos(sb, selector):
+    safe = selector.replace('"', '\\"')
+    info = js_eval(sb,
+        f'(function(){{'
+        f'  var el = document.querySelector("{safe}");'
+        f'  if (!el) return null;'
+        f'  var r = el.getBoundingClientRect();'
+        f'  return {{'
+        f'    "cx": r.left + r.width / 2,'
+        f'    "cy": r.top + r.height / 2,'
+        f'    "sx": window.screenX || 0,'
+        f'    "sy": window.screenY || 0,'
+        f'    "dh": window.outerHeight - window.innerHeight,'
+        f'    "dw": (window.outerWidth - window.innerWidth) / 2'
+        f'  }};'
+        f'}})()'
+    )
+    if not info:
+        return None, None
+    ox = int(info.get("sx", 0) + info.get("dw", 0))
+    oy = int(info.get("sy", 0) + info.get("dh", 0))
+    return int(info["cx"]) + ox, int(info["cy"]) + oy
+
+
+def get_page_text(sb):
+    return js_eval(sb, "document.body.innerText") or ""
+
+
+# ── NopeCHA CDK 领取 & 注入 ───────────────────────────────
+
+def extract_latest_cdk(text):
+    """从 Discord 私信文本里提取最新一条 NopeCHA CDK，并判断是否 24h 内。"""
+    pattern = re.findall(
+        r"Here is your Discord key for NopeCHA[:\s]+([a-z0-9]+).*?\(([^)]+)\)",
+        text, re.IGNORECASE | re.DOTALL,
+    )
+    if not pattern:
+        return "", False
+    cdk, time_label = pattern[-1]
+    is_recent = "内" in time_label
+    log("INFO", f"  📋 最新 CDK 时间标记: {time_label} | 24h内: {is_recent}")
+    return cdk, is_recent
+
+
+def inject_nopecha_key(sb, cdk):
+    """通过 nopecha.com/setup 激活 NopeCHA 插件额度。"""
+    if not cdk:
+        return
+    log("INFO", "💉 注入 key 到 NopeCHA 插件...")
+    sb.open(f"https://nopecha.com/setup#{cdk}")
+    time.sleep(3)
+    log("INFO", f"✅ key 注入完成: {cdk[:4]}****{cdk[-4:]}")
+
+
+def send_command_and_poll(sb):
+    """在 NopeCHA Discord 频道发送 !nopecha，并轮询私信提取 CDK。"""
+    sb.open(DISCORD_CHANNEL_URL)
+    time.sleep(3)
+
+    log("INFO", "🖱️ 定位消息输入框...")
+    ix, iy = get_element_screen_pos(sb, '[data-slate-editor="true"]')
+    if not ix:
+        log("ERROR", "❌ 找不到 Discord 输入框")
+        return ""
+
+    mouse_click(ix, iy, "输入框")
+    time.sleep(random.uniform(0.5, 1.0))
+
+    log("INFO", "⌨️ 输入 !nopecha ...")
+    keyboard_key("ctrl+a")
+    time.sleep(0.2)
+    keyboard_type("!nopecha")
+    time.sleep(random.uniform(0.4, 0.8))
+    keyboard_key("Return")
+
+    log("INFO", "✅ 命令已发送，等待私聊回复...")
+    time.sleep(5)
+
+    for attempt in range(20):
+        time.sleep(3)
+        log("INFO", f"  [{attempt*3+3}s] 打开私聊检查...")
+
+        sb.open(DISCORD_DM_URL)
+        time.sleep(5)
+
+        page_text = get_page_text(sb)
+        if page_text:
+            cdk, is_recent = extract_latest_cdk(page_text)
+            if cdk and is_recent:
+                log("INFO", f"✅ 提取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
+                return cdk
+
+        sb.open(DISCORD_CHANNEL_URL)
+        time.sleep(2)
+
+    return ""
+
+
+def ensure_cdk(sb):
+    """
+    确保 NopeCHA 插件有可用 key。
+    优先级: 环境变量 NOPECHA_KEY > 私信 24h 内旧 CDK > 发命令领新 CDK。
+    """
+    log("INFO", "=" * 50)
+    log("INFO", "🔑 开始 CDK 检查流程")
+    log("INFO", "=" * 50)
+
+    # 0) 显式配置了 key，直接注入
+    if NOPECHA_KEY:
+        log("INFO", "使用环境变量 NOPECHA_KEY，跳过 Discord 领取")
+        inject_nopecha_key(sb, NOPECHA_KEY)
+        return NOPECHA_KEY
+
+    # 1) 打开 Discord，确认登录态
+    sb.open(DISCORD_CHANNEL_URL)
+    time.sleep(8)
+    try:
+        cur = sb.get_current_url().lower()
+    except Exception:
+        cur = ""
+    if "login" in cur:
+        msg = "❌ Discord 登录态失效，请重新初始化 Profile"
+        log("ERROR", msg)
+        send_tg_text(TG_TOKEN, TG_CHAT_ID, f"VPS8 签到失败: {msg}")
+        return ""
+
+    # 2) 私信里找 24h 内的旧 CDK
+    log("INFO", "🔍 检查私聊是否已有24h内的 CDK...")
+    sb.open(DISCORD_DM_URL)
+    time.sleep(5)
+    page_text = get_page_text(sb)
+    cdk, is_recent = extract_latest_cdk(page_text) if page_text else ("", False)
+
+    if cdk and is_recent:
+        log("INFO", f"✅ 已有24h内的 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
+        inject_nopecha_key(sb, cdk)
+        return cdk
+
+    # 3) 去频道发命令领新的
+    log("INFO", "📭 无24h内的 CDK，去频道发送命令领取...")
+    cdk = send_command_and_poll(sb)
+    if not cdk:
+        msg = "❌ 未能获取 CDK，请检查 Discord"
+        log("ERROR", msg)
+        send_tg_text(TG_TOKEN, TG_CHAT_ID, f"VPS8 签到失败: {msg}")
+        return ""
+
+    inject_nopecha_key(sb, cdk)
+    return cdk
+
+
 # ── 页面状态解析 ──────────────────────────────────────────
 
 def is_signed(html):
@@ -276,21 +483,7 @@ def detect_browser_exit_ip(sb, timeout=20):
     return False, last_err
 
 
-# ── NopeCHA 插件相关 ──────────────────────────────────────
-
-def inject_nopecha_key(sb):
-    """若配置了 NOPECHA_KEY，则通过 nopecha.com/setup 激活插件额度。"""
-    if not NOPECHA_KEY:
-        log("INFO", "未配置 NOPECHA_KEY，使用插件默认额度")
-        return
-    try:
-        log("INFO", "注入 NopeCHA key...")
-        sb.open(f"https://nopecha.com/setup#{NOPECHA_KEY}")
-        time.sleep(3)
-        log("INFO", f"NopeCHA key 注入完成: {NOPECHA_KEY[:4]}****{NOPECHA_KEY[-4:]}")
-    except Exception as e:
-        log("WARN", f"NopeCHA key 注入失败: {e}")
-
+# ── hCaptcha（交给 NopeCHA 插件解）─────────────────────────
 
 def has_hcaptcha(sb):
     try:
@@ -305,10 +498,6 @@ def has_hcaptcha(sb):
 
 
 def wait_hcaptcha_solved(sb, scene="page", timeout=90):
-    """
-    等待 NopeCHA 插件自动解出 hCaptcha。
-    通过检测 h-captcha-response 隐藏字段是否被填充来判断。
-    """
     if not has_hcaptcha(sb):
         log("INFO", f"[{scene}] 未检测到 hCaptcha，跳过")
         return True
@@ -341,20 +530,18 @@ def wait_hcaptcha_solved(sb, scene="page", timeout=90):
 # ── 第三方登录 ────────────────────────────────────────────
 
 def login_via_oauth(sb):
-    """
-    使用第三方登录（GitHub / Google / Nodeloc）。
-    依赖持久化 Profile 中已登录的第三方账号，点击后自动回跳完成登录。
-    """
     provider_url = PROVIDER_LOGIN_URLS.get(LOGIN_PROVIDER)
     if not provider_url:
         return False, f"不支持的 LOGIN_PROVIDER: {LOGIN_PROVIDER}（可选 github/google/nodeloc）"
 
     log("INFO", f"打开登录页，使用第三方登录: {LOGIN_PROVIDER}")
-    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8) if hasattr(sb, "uc_open_with_reconnect") else sb.open(LOGIN_URL)
+    if hasattr(sb, "uc_open_with_reconnect"):
+        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8)
+    else:
+        sb.open(LOGIN_URL)
     time.sleep(4)
     screenshot(sb, "01_login_loaded")
 
-    # 优先点击页面上的第三方登录按钮；点不到就直接访问对应 OAuth URL
     provider_selectors = {
         "github":  ["a[href*='/github/login']", "a[title='GitHub']"],
         "google":  ["a[href*='/google/login']", "a[title='Google']"],
@@ -375,10 +562,7 @@ def login_via_oauth(sb):
         log("INFO", f"直接访问第三方登录 URL: {provider_url}")
         sb.open(provider_url)
 
-    # 等待授权 / 回跳完成
     time.sleep(6)
-
-    # 若第三方页面出现 hCaptcha（部分场景），尝试让 NopeCHA 解
     wait_hcaptcha_solved(sb, "oauth")
     time.sleep(3)
 
@@ -388,8 +572,7 @@ def login_via_oauth(sb):
     except Exception:
         pass
 
-    # 仍停留在本站登录页 or 第三方授权页 = 未登录成功
-    if "/login" in cur or "oauth" in cur or "authorize" in cur or "signin" in cur and "points" not in cur:
+    if "/login" in cur or "oauth" in cur or "authorize" in cur or ("signin" in cur and "points" not in cur):
         blob = get_page_blob(sb)
         net_err = detect_chrome_error(blob)
         screenshot(sb, "03_login_not_finished")
@@ -427,7 +610,6 @@ def do_signin(sb):
     if is_signed(html):
         return True, "今日已签到", before_points, before_points, None
 
-    # 签到动作可能触发 hCaptcha，交给 NopeCHA 解
     if not wait_hcaptcha_solved(sb, "signin"):
         return False, "签到失败", before_points, before_points, "签到 hCaptcha 求解失败"
 
@@ -440,7 +622,6 @@ def do_signin(sb):
     log("INFO", "已点击签到")
     time.sleep(3)
 
-    # 点击后可能再次弹出 hCaptcha
     wait_hcaptcha_solved(sb, "signin_after_click")
 
     for i in range(10):
@@ -458,10 +639,11 @@ def do_signin(sb):
 # ── 主流程 ────────────────────────────────────────────────
 
 def vps8_checkin():
+    global DISPLAY
     account_label = f"{LOGIN_PROVIDER} OAuth"
 
     log("INFO", "=" * 50)
-    log("INFO", "🚀 启动: VPS8 每日签到（第三方登录 + NopeCHA）")
+    log("INFO", "🚀 启动: VPS8 每日签到（第三方登录 + NopeCHA 自动 CDK）")
     log("INFO", f"代理: {mask_proxy(PROXY)}")
     log("INFO", f"登录方式: {LOGIN_PROVIDER}")
     log("INFO", f"Profile: {PROFILE_DIR}")
@@ -511,8 +693,13 @@ def vps8_checkin():
             sb_kwargs["proxy"] = PROXY
 
         with SB(**sb_kwargs) as sb:
-            # 激活 NopeCHA 额度（若配置了 key）
-            inject_nopecha_key(sb)
+            # 更新 DISPLAY（xvfb-run 会注入）
+            DISPLAY = os.environ.get("DISPLAY", DISPLAY)
+
+            # Step 1: 确保 NopeCHA 有可用 CDK（自动领取 + 注入）
+            cdk = ensure_cdk(sb)
+            if not cdk:
+                return False, "未能获取/注入 NopeCHA CDK"
 
             # 浏览器出口 IP 检测
             ok_bip, bip_or_err = detect_browser_exit_ip(sb, timeout=20)
@@ -525,7 +712,7 @@ def vps8_checkin():
                 send_tg_text(TG_TOKEN, TG_CHAT_ID, f"VPS8 签到失败: {reason}")
                 return False, reason
 
-            # 第三方登录
+            # Step 2: 第三方登录
             ok, reason = login_via_oauth(sb)
             if not ok:
                 finish(sb, "login_failed",
@@ -533,7 +720,7 @@ def vps8_checkin():
                 send_tg_text(TG_TOKEN, TG_CHAT_ID, f"VPS8 签到失败: {reason}")
                 return False, reason
 
-            # 签到
+            # Step 3: 签到
             success, result_text, before_points, current_points, fail_reason = do_signin(sb)
             caption = build_result_caption(
                 account_label, result_text, before_points, current_points, fail_reason
