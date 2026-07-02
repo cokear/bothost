@@ -371,8 +371,8 @@ def send_command_and_poll(sb):
         time.sleep(3)
         log("INFO", f"  [{attempt*3+3}s] 打开私聊检查...")
 
-        # 等私信里真正出现 NopeCHA 消息再解析，避免慢网络下过早读取
-        page_text = open_and_wait(sb, DISCORD_DM_URL, must_contain="NopeCHA", timeout=12)
+        # 等私信里真正出现 key 消息正文再解析（侧边栏只有机器人名，不足以判定已加载）
+        page_text = open_and_wait(sb, DISCORD_DM_URL, must_contain="Here is your Discord key", timeout=15)
         if page_text:
             # 刚发完命令，私信里最新一条即为新 key，只要提取到就接受
             cdk, _is_recent = extract_latest_cdk(page_text)
@@ -415,7 +415,8 @@ def ensure_cdk(sb):
 
     # 2) 私信里找 24h 内的旧 CDK
     log("INFO", "🔍 检查私聊是否已有24h内的 CDK...")
-    page_text = open_and_wait(sb, DISCORD_DM_URL, must_contain="NopeCHA", timeout=20)
+    page_text = open_and_wait(sb, DISCORD_DM_URL, must_contain="Here is your Discord key", timeout=25)
+    log("INFO", f"  (DM 文本长度: {len(page_text or '')})")
     cdk, is_recent = extract_latest_cdk(page_text) if page_text else ("", False)
 
     if cdk and is_recent:
