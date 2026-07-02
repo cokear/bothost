@@ -1,0 +1,131 @@
+name: 🔧 首次初始化 Discord Chrome Profile
+
+on:
+  workflow_dispatch:
+    inputs:
+      setup_profile:
+        description: '首次初始化 Profile？（输入 true 进入 noVNC 手动登录模式）'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: discord-profile-setup
+  cancel-in-progress: true
+
+jobs:
+  setup-profile:
+    name: 🔧 首次初始化 Discord Chrome Profile（noVNC + cloudflared）
+    runs-on: ubuntu-latest
+    if: github.event.inputs.setup_profile == 'true'
+
+    steps:
+      - name: 1. 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U seleniumbase
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb x11vnc xdotool fluxbox novnc websockify
+
+      - name: 4. 按需拉起代理（Sing-Box）
+        if: env.PROXY_STR != ''
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+        run: |
+          echo "✅ 检测到代理配置，正在拉起 Sing-Box..."
+          curl -LO https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
+          tar -xzf sing-box-1.9.3-linux-amd64.tar.gz
+          sudo cp sing-box-1.9.3-linux-amd64/sing-box /usr/local/bin/
+
+          # 使用仓库内的代理转换脚本
+          python convert_proxy.py
+
+          nohup sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 3
+
+          # 验证代理连通性（不显示 IP）
+          curl -sS --socks5 127.0.0.1:8080 \
+            -o /dev/null -w "代理隧道状态: %{http_code}\n" \
+            https://api.ipify.org || echo "⚠️ 代理可能未就绪，继续执行"
+
+      - name: 5. 启动 noVNC + cloudflared + Chrome，等待手动登录
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+        run: |
+          mkdir -p ~/.chrome-profile-discord
+
+          # 下载 cloudflared
+          curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+          # 启动虚拟屏幕
+          Xvfb :99 -screen 0 1280x800x24 &
+          export DISPLAY=:99
+          sleep 1
+
+          # 启动窗口管理器
+          fluxbox &
+          sleep 1
+
+          # 启动 VNC（无密码）
+          x11vnc -display :99 -forever -nopw -bg -quiet
+          sleep 1
+
+          # 启动 noVNC
+          websockify --web /usr/share/novnc 6080 localhost:5900 &
+          sleep 2
+
+          # 启动 cloudflared 临时隧道
+          nohup cloudflared tunnel --url http://localhost:6080 > /tmp/cf.log 2>&1 &
+          sleep 8
+
+          # 提取访问链接
+          CF_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  🌐 浏览器打开下面的链接远程操控 Chrome                     ║"
+          echo "║                                                              ║"
+          echo "║  👉 ${CF_URL}/vnc.html?autoconnect=true&reconnect=true"
+          echo "║                                                              ║"
+          echo "║  操作步骤：                                                  ║"
+          echo "║  1. 打开链接进入远程桌面                                     ║"
+          echo "║  2. 在 Chrome 中登录 Discord                                 ║"
+          echo "║  3. 确认已登录后等待倒计时结束                               ║"
+          echo "║  4. 系统自动保存 Profile 到缓存                              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          # 构造 Chrome 启动参数
+          CHROME_ARGS="--user-data-dir=$HOME/.chrome-profile-discord \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-session-crashed-bubble \
+            --disable-dev-shm-usage \
+            --no-sandbox \
+            --window-size=1280,800"
+
+          # 有代理则走代理
+          if [ -n "$PROXY_STR" ]; then
+            CHROME_ARGS="$CHROME_ARGS --proxy-server=http://127.0.0.1:8080"
+            echo "🌐 Chrome 已配置代理"
+          fi
+
+          google-chrome $CHROME_ARGS \
+            --new-window https://discord.com/login &
+
+          echo ""
+          echo "⏳ 等待 6 分钟供手动登录..."
+          sleep 360
+
+      - name: 6. 保存 Chrome Profile 到 Actions Cache
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1-${{ github.run_id }}
