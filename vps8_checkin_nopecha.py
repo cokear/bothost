@@ -258,6 +258,32 @@ def get_page_text(sb):
     return js_eval(sb, "document.body.innerText") or ""
 
 
+def open_and_wait(sb, url, must_contain=None, timeout=25, min_len=50):
+    """打开 URL 并等待内容真正加载出来，缓解慢网络下过早检测导致的误判。
+
+    - must_contain: 页面文本需包含的关键字（如 "NopeCHA"）；命中即返回
+    - 否则等待文本长度达到 min_len 视为已加载
+    返回最后一次读取到的页面文本。
+    """
+    try:
+        sb.open(url)
+    except Exception as e:
+        log("WARN", f"打开 {url} 失败: {e}")
+
+    end = time.time() + timeout
+    last = ""
+    while time.time() < end:
+        txt = get_page_text(sb)
+        last = txt
+        if must_contain:
+            if must_contain in txt:
+                return txt
+        elif txt and len(txt) >= min_len:
+            return txt
+        time.sleep(1)
+    return last
+
+
 # ── NopeCHA CDK 领取 & 注入 ───────────────────────────────
 
 def extract_latest_cdk(text):
@@ -301,8 +327,7 @@ def inject_nopecha_key(sb, cdk):
 
 def send_command_and_poll(sb):
     """在 NopeCHA Discord 频道发送 !nopecha，并轮询私信提取 CDK。"""
-    sb.open(DISCORD_CHANNEL_URL)
-    time.sleep(3)
+    open_and_wait(sb, DISCORD_CHANNEL_URL, timeout=20)
 
     log("INFO", "🖱️ 定位消息输入框...")
     ix, iy = get_element_screen_pos(sb, '[data-slate-editor="true"]')
@@ -327,10 +352,8 @@ def send_command_and_poll(sb):
         time.sleep(3)
         log("INFO", f"  [{attempt*3+3}s] 打开私聊检查...")
 
-        sb.open(DISCORD_DM_URL)
-        time.sleep(5)
-
-        page_text = get_page_text(sb)
+        # 等私信里真正出现 NopeCHA 消息再解析，避免慢网络下过早读取
+        page_text = open_and_wait(sb, DISCORD_DM_URL, must_contain="NopeCHA", timeout=12)
         if page_text:
             # 刚发完命令，私信里最新一条即为新 key，只要提取到就接受
             cdk, _is_recent = extract_latest_cdk(page_text)
@@ -360,8 +383,7 @@ def ensure_cdk(sb):
         return NOPECHA_KEY
 
     # 1) 打开 Discord，确认登录态
-    sb.open(DISCORD_CHANNEL_URL)
-    time.sleep(8)
+    open_and_wait(sb, DISCORD_CHANNEL_URL, timeout=20)
     try:
         cur = sb.get_current_url().lower()
     except Exception:
@@ -374,9 +396,7 @@ def ensure_cdk(sb):
 
     # 2) 私信里找 24h 内的旧 CDK
     log("INFO", "🔍 检查私聊是否已有24h内的 CDK...")
-    sb.open(DISCORD_DM_URL)
-    time.sleep(5)
-    page_text = get_page_text(sb)
+    page_text = open_and_wait(sb, DISCORD_DM_URL, must_contain="NopeCHA", timeout=20)
     cdk, is_recent = extract_latest_cdk(page_text) if page_text else ("", False)
 
     if cdk and is_recent:
