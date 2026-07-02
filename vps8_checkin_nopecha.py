@@ -258,9 +258,11 @@ def get_page_text(sb):
     return js_eval(sb, "document.body.innerText") or ""
 
 
-def open_and_wait(sb, url, must_contain=None, timeout=25, min_len=50):
+def open_and_wait(sb, url, must_contain=None, timeout=25, settle=6, min_len=50):
     """打开 URL 并等待内容真正加载出来，缓解慢网络下过早检测导致的误判。
 
+    - settle: 打开后先等待的秒数，给重型 SPA（如 Discord）渲染时间，
+      避免过早调用 execute_script 触发 "script timeout"
     - must_contain: 页面文本需包含的关键字（如 "NopeCHA"）；命中即返回
     - 否则等待文本长度达到 min_len 视为已加载
     返回最后一次读取到的页面文本。
@@ -270,17 +272,20 @@ def open_and_wait(sb, url, must_contain=None, timeout=25, min_len=50):
     except Exception as e:
         log("WARN", f"打开 {url} 失败: {e}")
 
+    # 先给重型 SPA 一点渲染时间，避免过早 execute_script 卡死
+    time.sleep(settle)
+
     end = time.time() + timeout
     last = ""
     while time.time() < end:
-        txt = get_page_text(sb)
+        txt = get_page_text(sb)  # js_eval 内部已 try/except，超时返回 ""
         last = txt
         if must_contain:
             if must_contain in txt:
                 return txt
         elif txt and len(txt) >= min_len:
             return txt
-        time.sleep(1)
+        time.sleep(2)
     return last
 
 
@@ -327,12 +332,26 @@ def inject_nopecha_key(sb, cdk):
 
 def send_command_and_poll(sb):
     """在 NopeCHA Discord 频道发送 !nopecha，并轮询私信提取 CDK。"""
-    open_and_wait(sb, DISCORD_CHANNEL_URL, timeout=20)
+    open_and_wait(sb, DISCORD_CHANNEL_URL, timeout=25)
 
     log("INFO", "🖱️ 定位消息输入框...")
-    ix, iy = get_element_screen_pos(sb, '[data-slate-editor="true"]')
+    editor_sel = '[data-slate-editor="true"]'
+    # 显式等输入框元素出现（Discord 加载慢），再多次重试拿屏幕坐标
+    try:
+        sb.wait_for_element_present(editor_sel, timeout=25)
+    except Exception:
+        pass
+
+    ix, iy = None, None
+    for _ in range(6):
+        ix, iy = get_element_screen_pos(sb, editor_sel)
+        if ix:
+            break
+        time.sleep(2)
+
     if not ix:
         log("ERROR", "❌ 找不到 Discord 输入框")
+        screenshot(sb, "discord_no_input")
         return ""
 
     mouse_click(ix, iy, "输入框")
@@ -731,6 +750,13 @@ def vps8_checkin():
         with SB(**sb_kwargs) as sb:
             # 更新 DISPLAY（xvfb-run 会注入）
             DISPLAY = os.environ.get("DISPLAY", DISPLAY)
+
+            # 调大脚本/页面超时，避免重型 SPA 下 execute_script 触发 script timeout
+            try:
+                sb.driver.set_script_timeout(30)
+                sb.driver.set_page_load_timeout(60)
+            except Exception as e:
+                log("WARN", f"设置超时失败（忽略）: {e}")
 
             # Step 1: 确保 NopeCHA 有可用 CDK（自动领取 + 注入）
             cdk = ensure_cdk(sb)
