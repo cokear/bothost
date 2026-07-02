@@ -674,7 +674,11 @@ def do_signin(sb):
         dump_html(sb, "04_signin_no_button")
         return False, "签到失败", before_points, before_points, "找不到签到按钮"
 
-    sb.click("#points-signin-submit")
+    bx, by = get_element_screen_pos(sb, "#points-signin-submit")
+    if bx:
+        mouse_click(bx, by, "签到按钮")
+    else:
+        sb.click("#points-signin-submit")
     log("INFO", "已点击签到")
     time.sleep(3)
 
