@@ -1,0 +1,101 @@
+name: 🔐🎯 VPS8 每日签到（Nodeloc 登录 + NopeCHA）
+
+on:
+  schedule:
+    # 每天 UTC 01:00（北京时间 09:00）触发，可自行调整
+    - cron: '0 1 * * *'
+  repository_dispatch:
+    types: [vps8]
+  workflow_dispatch:
+
+concurrency:
+  group: vps8-checkin
+  cancel-in-progress: true
+
+jobs:
+  vps8-checkin:
+    name: 🔐🎯 Nodeloc 登录并签到
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 1. 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U seleniumbase requests pyvirtualdisplay
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb
+          seleniumbase install chromedriver
+          seleniumbase install chrome
+          echo "✅ 依赖安装完成"
+
+      - name: 4. 还原 Chrome Profile（复用 Bot-Hosting 那份，含第三方登录态 + NopeCHA key）
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1
+          fail-on-cache-miss: false
+
+      - name: 5. 清理 Chrome Profile 锁文件（防异常退出残留）
+        run: |
+          rm -f ~/.chrome-profile-discord/SingletonLock
+          rm -f ~/.chrome-profile-discord/SingletonSocket
+          rm -f ~/.chrome-profile-discord/SingletonCookie
+          echo "✅ 锁文件清理完成"
+
+      - name: 6. 按需拉起代理（Sing-Box）
+        if: env.PROXY_STR != ''
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+        run: |
+          echo "✅ 检测到代理配置，正在拉起 Sing-Box..."
+          curl -LO https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
+          tar -xzf sing-box-1.9.3-linux-amd64.tar.gz
+          sudo cp sing-box-1.9.3-linux-amd64/sing-box /usr/local/bin/
+          python convert_proxy.py
+          nohup sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 3
+          curl -sS --socks5 127.0.0.1:8080 \
+            -o /dev/null -w "代理状态: %{http_code}\n" \
+            https://api.ipify.org || echo "⚠️ 代理可能未就绪，继续执行"
+
+      - name: 7. 执行签到脚本
+        env:
+          PROXY_STR:             ${{ secrets.PROXY_STR }}
+          LOGIN_PROVIDER:        nodeloc                          # 使用 Nodeloc 第三方登录
+          NOPECHA_KEY:           ${{ secrets.NOPECHA_KEY }}       # 可选：NopeCHA 套餐 key
+          NOPECHA_EXT_DIR:       ${{ github.workspace }}/chromium # 仓库内 NopeCHA 解压目录
+          TG_BOT_TOKEN:          ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:            ${{ secrets.TG_CHAT_ID }}
+          BROWSER_USER_DATA_DIR: /home/runner/.chrome-profile-discord
+        run: |
+          if [ -n "$PROXY_STR" ]; then
+            export BROWSER_PROXY="http://127.0.0.1:8080"
+            export PROXY="http://127.0.0.1:8080"
+          fi
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python vps8_checkin_nopecha.py
+
+      - name: 8. 上传失败截图 / HTML（便于排查）
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vps8-screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 9. 保存更新后的 Chrome Profile（复用同一份缓存）
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1
