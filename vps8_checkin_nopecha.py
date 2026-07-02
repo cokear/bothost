@@ -261,16 +261,31 @@ def get_page_text(sb):
 # ── NopeCHA CDK 领取 & 注入 ───────────────────────────────
 
 def extract_latest_cdk(text):
-    """从 Discord 私信文本里提取最新一条 NopeCHA CDK，并判断是否 24h 内。"""
-    pattern = re.findall(
-        r"Here is your Discord key for NopeCHA[:\s]+([a-z0-9]+).*?\(([^)]+)\)",
+    """从 Discord 私信文本里提取最新一条 NopeCHA CDK，并判断是否 24h 内。
+
+    注意：key 提取与时间标记解析解耦，避免因括号/文案变化整体匹配失败。
+    时间标记兼容中英文括号 ( ) （ ）。
+    """
+    if not text:
+        return "", False
+
+    # 1) 先独立提取所有 key，取最后一条（最新）
+    keys = re.findall(
+        r"Here is your Discord key for NopeCHA[:\s]+([A-Za-z0-9]{6,})",
+        text, re.IGNORECASE,
+    )
+    if not keys:
+        return "", False
+    cdk = keys[-1]
+
+    # 2) 在该 key 之后查找括号内的时间标记（兼容半角/全角括号）
+    m = re.search(
+        re.escape(cdk) + r".*?[\(（]([^\)）]+)[\)）]",
         text, re.IGNORECASE | re.DOTALL,
     )
-    if not pattern:
-        return "", False
-    cdk, time_label = pattern[-1]
-    is_recent = "内" in time_label
-    log("INFO", f"  📋 最新 CDK 时间标记: {time_label} | 24h内: {is_recent}")
+    time_label = m.group(1).strip() if m else ""
+    is_recent = (("内" in time_label) or ("within" in time_label.lower())) if time_label else False
+    log("INFO", f"  📋 最新 CDK 时间标记: {time_label or '<无>'} | 24h内: {is_recent}")
     return cdk, is_recent
 
 
@@ -317,9 +332,10 @@ def send_command_and_poll(sb):
 
         page_text = get_page_text(sb)
         if page_text:
-            cdk, is_recent = extract_latest_cdk(page_text)
-            if cdk and is_recent:
-                log("INFO", f"✅ 提取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
+            # 刚发完命令，私信里最新一条即为新 key，只要提取到就接受
+            cdk, _is_recent = extract_latest_cdk(page_text)
+            if cdk:
+                log("INFO", f"✅ 提取到 CDK: {cdk[:4]}****{cdk[-4:]}")
                 return cdk
 
         sb.open(DISCORD_CHANNEL_URL)
