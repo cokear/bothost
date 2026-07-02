@@ -1,9 +1,7 @@
 name: 🔐🎯 VPS8 每日签到（Nodeloc 登录 + NopeCHA）
 
 on:
-  schedule:
-    # 每天 UTC 01:00（北京时间 09:00）触发，可自行调整
-    - cron: '0 1 * * *'
+
   repository_dispatch:
     types: [vps8]
   workflow_dispatch:
