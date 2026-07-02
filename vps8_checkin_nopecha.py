@@ -46,7 +46,7 @@ DISCORD_CHANNEL_URL = os.getenv(
 )
 DISCORD_DM_URL = os.getenv(
     "DISCORD_DM_URL",
-    "https://discord.com/channels/@me/1519516877074731018",
+    "https://discord.com/channels/@me/1514785932203528202",
 )
 
 SS_DIR = os.getenv("SS_DIR", "screenshots")
