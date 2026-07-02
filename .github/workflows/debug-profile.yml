@@ -1,0 +1,247 @@
+name: 🛠️ 调试 Discord Chrome Profile（noVNC 远程）
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait_minutes:
+        description: '远程操作等待时长（分钟，默认 10）'
+        required: false
+        default: '10'
+      open_url:
+        description: '启动后自动打开的页面（留空则打开 Discord DM）'
+        required: false
+        default: ''
+
+concurrency:
+  group: discord-profile-debug
+  cancel-in-progress: true
+
+jobs:
+  debug-profile:
+    name: 🛠️ 远程调试 Chrome Profile
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U seleniumbase
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb x11vnc xdotool fluxbox novnc websockify
+
+      - name: 3.5 安装 Chrome for Testing
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+        id: setup-chrome
+
+      - name: 4. 恢复 Chrome Profile 缓存
+        id: restore-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1-${{ github.run_id }}
+          restore-keys: |
+            chrome-profile-discord-v1-
+
+      - name: 5. 检查 Profile 是否存在
+        run: |
+          if [ ! -d "$HOME/.chrome-profile-discord" ]; then
+            echo "❌ 未找到 Chrome Profile，请先运行「首次初始化」工作流"
+            exit 1
+          fi
+          echo "✅ Chrome Profile 已恢复"
+          du -sh ~/.chrome-profile-discord
+
+      - name: 6. 打印当前 NopeCHA Key（调试用）
+        run: |
+          MANIFEST="chromium/manifest.json"
+          if [ -f "$MANIFEST" ]; then
+            KEY=$(python3 -c "
+          import json
+          with open('$MANIFEST') as f:
+              m = json.load(f)
+          key = m.get('nopecha', {}).get('key', '')
+          if key:
+              print(key[:4] + '****' + key[-4:])
+          else:
+              print('（未设置）')
+          ")
+            echo "🔑 当前 NopeCHA Key: $KEY"
+          else
+            echo "⚠️ manifest.json 不存在，路径: $MANIFEST"
+          fi
+
+      - name: 7. 按需拉起代理（Sing-Box）
+        if: env.PROXY_STR != ''
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+        run: |
+          echo "✅ 检测到代理配置，正在拉起 Sing-Box..."
+          curl -LO https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
+          tar -xzf sing-box-1.9.3-linux-amd64.tar.gz
+          sudo cp sing-box-1.9.3-linux-amd64/sing-box /usr/local/bin/
+
+          python convert_proxy.py
+
+          nohup sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 3
+
+          curl -sS --socks5 127.0.0.1:8080 \
+            -o /dev/null -w "代理隧道状态: %{http_code}\n" \
+            https://api.ipify.org || echo "⚠️ 代理可能未就绪，继续执行"
+
+      - name: 8. 准备 Chrome Profile（删锁、开发者模式、验证插件）
+        run: |
+          # 删除锁文件（避免上次运行残留导致 Chrome 拒绝启动）
+          rm -f ~/.chrome-profile-discord/SingletonLock
+          rm -f ~/.chrome-profile-discord/SingletonSocket
+          rm -f ~/.chrome-profile-discord/SingletonCookie
+          echo "✅ 锁文件已清理"
+
+          # 通过 Preferences 文件开启开发者模式（为 chrome://extensions 显示）
+          PREFS="$HOME/.chrome-profile-discord/Default/Preferences"
+          if [ -f "$PREFS" ]; then
+            python3 -c "
+          import json
+          with open('$PREFS', 'r') as f:
+              p = json.load(f)
+          p.setdefault('extensions', {})['ui'] = {'developer_mode': True}
+          with open('$PREFS', 'w') as f:
+              json.dump(p, f)
+          print('✅ 已通过 Preferences 开启开发者模式')
+          "
+          else
+            echo "⚠️ Preferences 不存在：$PREFS"
+          fi
+
+          # 验证插件目录
+          if [ -d "$GITHUB_WORKSPACE/chromium" ]; then
+            echo "✅ NopeCHA 插件目录存在：$GITHUB_WORKSPACE/chromium"
+            test -f "$GITHUB_WORKSPACE/chromium/manifest.json" && echo "✅ manifest.json 存在" || (echo "❌ manifest.json 不存在" && exit 1)
+          else
+            echo "❌ chromium/ 目录不存在，插件无法加载"
+            exit 1
+          fi
+
+      - name: 9. 启动 noVNC + cloudflared + Chrome（带自愈 watchdog）
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+          WAIT_MINUTES: ${{ github.event.inputs.wait_minutes }}
+          OPEN_URL: ${{ github.event.inputs.open_url }}
+        run: |
+          set -e
+
+          # 下载 cloudflared
+          curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+          # 启动虚拟屏幕
+          Xvfb :99 -screen 0 1280x800x24 &
+          export DISPLAY=:99
+          sleep 1
+
+          # 启动窗口管理器
+          fluxbox &
+          sleep 1
+
+          # 启动 VNC（无密码）— 不用 -bg/-quiet，输出到日志，便于排查卡死
+          x11vnc -display :99 -forever -nopw -rfbport 5900 -shared -o /tmp/x11vnc.log &
+          sleep 2
+
+          # 启动 noVNC
+          websockify --web /usr/share/novnc 6080 localhost:5900 &
+          sleep 2
+
+          # 启动 cloudflared 临时隧道
+          nohup cloudflared tunnel --url http://localhost:6080 > /tmp/cf.log 2>&1 &
+          sleep 8
+
+          # 提取访问链接
+          CF_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
+          if [ -z "$CF_URL" ]; then
+            echo "❌ 未获取到 trycloudflare 链接，打印 /tmp/cf.log："
+            tail -200 /tmp/cf.log || true
+            exit 1
+          fi
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  🌐 浏览器打开下面的链接远程操控 Chrome                     ║"
+          echo "║                                                              ║"
+          echo "║  👉 ${CF_URL}/vnc.html?autoconnect=true&reconnect=true"
+          echo "║                                                              ║"
+          echo "║  建议打开页面：chrome://extensions                            ║"
+          echo "║  用来确认 NopeCHA 插件是否加载、reload 后 key 是否生效       ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          # 构造 Chrome 启动参数
+          TARGET_URL="${OPEN_URL:-chrome://extensions}"
+
+          CHROME_ARGS="--user-data-dir=$HOME/.chrome-profile-discord \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-session-crashed-bubble \
+            --no-restore-last-session \
+            --disable-dev-shm-usage \
+            --no-sandbox \
+            --window-size=1280,800"
+
+          # 有代理则走代理
+          if [ -n "$PROXY_STR" ]; then
+            CHROME_ARGS="$CHROME_ARGS --proxy-server=http://127.0.0.1:8080"
+            echo "🌐 Chrome 已配置代理"
+          fi
+
+          # 加载 NopeCHA 插件
+          CHROME_ARGS="$CHROME_ARGS --load-extension=$GITHUB_WORKSPACE/chromium"
+          echo "🧩 NopeCHA 插件将以 --load-extension 方式加载"
+
+          CHROME_BIN="${{ steps.setup-chrome.outputs.chrome-path }}"
+          echo "🌐 Chrome for Testing: $CHROME_BIN"
+
+          start_chrome() {
+            rm -f ~/.chrome-profile-discord/SingletonLock ~/.chrome-profile-discord/SingletonSocket ~/.chrome-profile-discord/SingletonCookie || true
+            "$CHROME_BIN" $CHROME_ARGS --new-window "$TARGET_URL" >/tmp/chrome.log 2>&1 &
+            echo $! > /tmp/chrome.pid
+            echo "✅ 已启动 Chrome (pid=$(cat /tmp/chrome.pid))"
+          }
+
+          start_chrome
+
+          WAIT_SECS=$(( ${WAIT_MINUTES:-10} * 60 ))
+          echo ""
+          echo "⏳ 等待 ${WAIT_MINUTES:-10} 分钟供远程操作（watchdog 每 5s 自检）..."
+
+          # watchdog：Chrome 退出则重启；同时把最近日志打出来方便定位
+          for i in $(seq 1 $((WAIT_SECS/5))); do
+            if [ -f /tmp/chrome.pid ]; then
+              PID=$(cat /tmp/chrome.pid)
+              if ! kill -0 "$PID" >/dev/null 2>&1; then
+                echo "⚠️ Chrome 已退出，重启..."
+                tail -80 /tmp/chrome.log || true
+                start_chrome
+              fi
+            fi
+            sleep 5
+          done
+
+      - name: 10. 覆盖保存 Chrome Profile 到 Cache
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1-${{ github.run_id }}
+
+      - name: 11. 完成
+        run: |
+          echo "✅ Chrome Profile 已保存，本次调试结束"
+          echo "下次自动领取任务将使用最新 Profile"
