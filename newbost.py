@@ -234,6 +234,10 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
             sb.save_screenshot(str(HERE / "page_debug.png"))
             return False, 0
 
+        # 如果页面有 Cloudflare Turnstile，等待 NopeCHA 插件自动解决
+        log("INFO", "⏳ 预留 15 秒钟等待可能存在的人机验证自动打勾...")
+        sb.sleep(15)
+
         buttons = sb.find_elements(renew_css)
         total_buttons = len(buttons)
         log("INFO", f"✓ 找到 {total_buttons} 个按钮，准备点击")
@@ -250,15 +254,12 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                 
                 btn = current_buttons[i]
                 text = (btn.text or "").strip()
-                enabled = btn.is_enabled()
-                log("INFO", f"[{i+1}/{total_buttons}] '{text}' enabled={enabled}")
                 
-                if not enabled:
-                    log("WARN", "  ⚠️  按钮 disabled，跳过")
-                    continue
+                log("INFO", f"[{i+1}/{total_buttons}] '{text}' 准备强行点击！")
                 
                 sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                sb.sleep(0.5)
+                sb.sleep(1)
+                # 使用原生 JS Click，无视 Selenium 所谓的是否可聚焦、是否被遮挡
                 sb.execute_script("arguments[0].click();", btn)
                 clicked += 1
                 sb.sleep(COOLDOWN_BETWEEN_CLICKS)
