@@ -4,6 +4,7 @@ bot-hosting.net 自动续期 (纯正 OAuth 登录版 + 完整 CDK 领取逻辑)
 import time
 import os
 import re
+import json
 import random
 import subprocess
 import requests
@@ -92,6 +93,45 @@ def js_eval(sb, expr: str):
     except Exception as e:
         log("WARN", f"js_eval 失败: {e}")
         return None
+
+def js_click_by_text(sb, texts, tags=("a", "button"), href_contains=None):
+    """CDP 模式下按可见文本 / href 找元素并 JS 点击，命中返回 True。
+
+    CDP 模式（uc=True）的选择器引擎不支持 :contains()，所以文本匹配
+    全部放到页面内 JS 里做，绕开 wait_for_element_visible / find_element。
+    """
+    payload = {
+        "texts": [t.lower() for t in texts],
+        "tags": list(tags),
+        "href": (href_contains or "").lower(),
+    }
+    js = """(function(){
+        var cfg = __PAYLOAD__;
+        var els = [];
+        cfg.tags.forEach(function(tag){
+            document.querySelectorAll(tag).forEach(function(e){ els.push(e); });
+        });
+        for (var i = els.length - 1; i >= 0; i--) {
+            var e = els[i];
+            var r = e.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            var txt  = (e.innerText || e.textContent || '').trim().toLowerCase();
+            var href = (e.getAttribute('href') || '').toLowerCase();
+            var hit = false;
+            if (cfg.href && href.indexOf(cfg.href) !== -1) hit = true;
+            if (!hit) cfg.texts.forEach(function(t){ if (t && txt.indexOf(t) !== -1) hit = true; });
+            if (hit) { e.scrollIntoView({block:'center'}); e.click(); return true; }
+        }
+        return false;
+    })()""".replace("__PAYLOAD__", json.dumps(payload))
+    # 注意：不能走 js_eval（它会在外层加 return，CDP 的 Runtime.evaluate
+    # 顶层不允许 return，会报 Illegal return statement）。IIFE 本身就是表达式，
+    # 直接 execute_script 求值即可。
+    try:
+        return bool(sb.execute_script(js))
+    except Exception as e:
+        log("WARN", f"js_click_by_text 失败: {e}")
+        return False
 
 def xdo(args: list):
     env = {**os.environ, "DISPLAY": DISPLAY}
@@ -283,32 +323,27 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
         sb.sleep(4)
         
         cur_url = sb.get_current_url()
-        if "login" in cur_url:
-            log("INFO", "当前在登录页，查找 Discord 登录按钮...")
-            # 兼容 SeleniumBase UC CDP 的纯 CSS 选择器（注意不能用 cssselect 不支持的 i 标志）
-            discord_btn_css = 'a[href*="discord"], button:contains("Discord"), a:contains("Discord")'
-            try:
-                sb.wait_for_element_visible(discord_btn_css, timeout=10)
-                btn = sb.find_element(discord_btn_css)
-                sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                sb.sleep(1)
-                sb.execute_script("arguments[0].click();", btn)
-                log("INFO", "✓ 已点击面板的 Discord 登录按钮")
-            except Exception as e:
-                log("ERROR", f"找不到 Discord 登录按钮: {e}")
-                (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
-                sb.save_screenshot(str(HERE / "page_debug.png"))
-                raise RuntimeError("登录页找不到 Discord 按钮")
-
-            log("INFO", "正在监听跳转流程...")
+        if "login" in cur_url and "oauth2" not in cur_url:
+            # 登录页有固定链接 <a href="/login/discord">Continue with Discord</a>，
+            # 带 data-sveltekit-reload（整页跳转），直接开这个 URL 等价于点它，最稳。
+            log("INFO", "直接跳转 Discord OAuth 入口 /login/discord ...")
+            sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", 4)
+            sb.sleep(4)
             oauth_success = False
+            authorized_seen = False   # 是否已经进过 Discord 授权页
             for _ in range(20):
                 sb.sleep(2)
-                if len(sb.driver.window_handles) > 1:
-                    sb.switch_to_newest_window()
-                    
-                u = sb.get_current_url()
+                # 直接跳转式登录是同标签重定向，不会开新窗口；
+                # 且 uc_open_with_reconnect 会短暂断开 driver，
+                # 绝不能碰 sb.driver.window_handles（原生 Selenium 命令，会 Connection refused）。
+                try:
+                    u = sb.get_current_url()
+                except Exception as e:
+                    log("WARN", f"get_current_url 抖动（重连窗口期），重试: {e}")
+                    continue
+
                 if "discord.com/oauth2/authorize" in u:
+                    authorized_seen = True
                     log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行终极滑动逻辑...")
                     # 1. 终极滑动（照搬参考脚本的最强滑动黑科技）
                     sb.execute_script("""
@@ -334,29 +369,16 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
                     """)
                     sb.sleep(1.5)
                     
-                    # 2. 寻找并点击授权按钮（照搬参考脚本的容错循环）
-                    clicked = False
-                    for sel in ['button:contains("Authorize")', 'button:contains("授权")', 'button[type="submit"]', 'div[class*="footer"] button', 'button[class*="primary"]']:
-                        try:
-                            elements = sb.find_elements(sel)
-                            # 从后往前找，通常主按钮在最后
-                            for btn in reversed(elements):
-                                if not btn.is_displayed():
-                                    continue
-                                text = (btn.text or "").strip().lower()
-                                if any(k in text for k in ("取消", "cancel", "deny")):
-                                    continue
-                                sb.execute_script("arguments[0].click();", btn)
-                                log("INFO", f"[OAuth] ✓ 成功点击 Discord 授权按钮！(命中: {sel})")
-                                clicked = True
-                                break
-                            if clicked:
-                                break
-                        except Exception:
-                            continue
-                    sb.sleep(2)
-                elif "bot-hosting.net" in u and "login" not in u:
-                    log("INFO", f"✓ OAuth 授权完成，成功返回面板: {u}")
+                    # 2. 寻找并点击授权按钮（CDP 安全版：JS 文本匹配）
+                    if js_click_by_text(sb, texts=["authorize", "授权"], tags=("button",)):
+                        log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
+                    sb.sleep(3)   # 给重定向留时间
+                elif authorized_seen and "bot-hosting.net" in u and "oauth2" not in u:
+                    # 授权后会重定向回 bot-hosting.net/login?code=...（含 login），
+                    # 不能用 "login not in u" 判断，否则误判成没成功。
+                    # 只有在“进过授权页之后”再回到 bot-hosting 域名才算通过，
+                    # 避免刚跳转、还没到 discord 授权页时就误判成功。
+                    log("INFO", f"✓ 已离开 Discord 授权页，返回 bot-hosting: {u}")
                     oauth_success = True
                     break
             
