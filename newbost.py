@@ -155,59 +155,56 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
         sb.sleep(4)
         
         cur_url = sb.get_current_url()
-        if "login" in cur_url and "oauth2" not in cur_url:
-            oauth_success = False
-            authorized_seen = False   # 是否已经进过 Discord 授权页
-            for _ in range(20):
-                sb.sleep(2)
-                try:
-                    u = sb.get_current_url()
-                except Exception as e:
-                    log("WARN", f"get_current_url 抖动（重连窗口期），重试: {e}")
-                    continue
+        oauth_success = False
+        authorized_seen = False   # 是否已经进过 Discord 授权页
+        for _ in range(20):
+            sb.sleep(2)
+            try:
+                u = sb.get_current_url()
+            except Exception as e:
+                log("WARN", f"get_current_url 抖动（重连窗口期），重试: {e}")
+                continue
 
-                if "discord.com/oauth2/authorize" in u:
-                    authorized_seen = True
-                    log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行终极滑动逻辑...")
-                    # 1. 终极滑动（照搬参考脚本的最强滑动黑科技）
-                    sb.execute_script("""
-                        const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
-                            '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
-                            'div[class*="modal"] div[style*="overflow"]','div[class*="root"] div[style*="overflow"]'];
-                        let scrolled = false;
-                        for (const sel of sels) {
-                            for (const el of document.querySelectorAll(sel)) {
-                                const s = getComputedStyle(el);
-                                if (el.scrollHeight > el.clientHeight &&
-                                    ['auto','scroll'].some(v => s.overflowY === v || s.overflow === v))
-                                    { el.scrollTop = el.scrollHeight; scrolled = true; }
-                            }
+            if "discord.com/oauth2/authorize" in u:
+                authorized_seen = True
+                log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行终极滑动逻辑...")
+                # 1. 终极滑动（照搬参考脚本的最强滑动黑科技）
+                sb.execute_script("""
+                    const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
+                        '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
+                        'div[class*="modal"] div[style*="overflow"]','div[class*="root"] div[style*="overflow"]'];
+                    let scrolled = false;
+                    for (const sel of sels) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            const s = getComputedStyle(el);
+                            if (el.scrollHeight > el.clientHeight &&
+                                ['auto','scroll'].some(v => s.overflowY === v || s.overflow === v))
+                                { el.scrollTop = el.scrollHeight; scrolled = true; }
                         }
-                        if (!scrolled) document.querySelectorAll('div').forEach(el => {
-                            if (el.scrollHeight > el.clientHeight + 10) {
-                                const s = getComputedStyle(el);
-                                if (['auto','scroll','hidden'].includes(s.overflowY)) el.scrollTop = el.scrollHeight;
-                            }
-                        });
-                        scrollTo(0, document.body.scrollHeight);
-                    """)
-                    sb.sleep(1.5)
-                    
-                    # 2. 寻找并点击授权按钮（CDP 安全版：JS 文本匹配）
-                    if js_click_by_text(sb, texts=["authorize", "授权"], tags=("button",)):
-                        log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
-                    sb.sleep(3)   # 给重定向留时间
-                elif authorized_seen and "bot-hosting.net" in u and "oauth2" not in u:
-                    log("INFO", f"✓ 已离开 Discord 授权页，返回 bot-hosting: {u}")
-                    oauth_success = True
-                    break
-            
-            if not oauth_success:
-                (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
-                sb.save_screenshot(str(HERE / "page_debug.png"))
-                raise RuntimeError("OAuth 流程超时，未能成功跳回面板")
-        else:
-            log("INFO", f"✓ 似乎已经处于登录状态 (URL: {cur_url})")
+                    }
+                    if (!scrolled) document.querySelectorAll('div').forEach(el => {
+                        if (el.scrollHeight > el.clientHeight + 10) {
+                            const s = getComputedStyle(el);
+                            if (['auto','scroll','hidden'].includes(s.overflowY)) el.scrollTop = el.scrollHeight;
+                        }
+                    });
+                    scrollTo(0, document.body.scrollHeight);
+                """)
+                sb.sleep(1.5)
+                
+                # 2. 寻找并点击授权按钮（CDP 安全版：JS 文本匹配）
+                if js_click_by_text(sb, texts=["authorize", "授权"], tags=("button",)):
+                    log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
+                sb.sleep(3)   # 给重定向留时间
+            elif "bot-hosting.net" in u and "login" not in u:
+                log("INFO", f"✓ 成功进入或返回面板 (URL: {u})")
+                oauth_success = True
+                break
+        
+        if not oauth_success:
+            (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
+            sb.save_screenshot(str(HERE / "page_debug.png"))
+            raise RuntimeError("OAuth 流程超时，未能成功跳回面板")
 
         # ---------------- 跳转 Billings ----------------
         log("INFO", f"\n=== [Step 2] 跳转 {BILLINGS_URL} ===")
