@@ -330,20 +330,13 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
             sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", 4)
             sb.sleep(4)
             oauth_success = False
-            authorized_seen = False   # 是否已经进过 Discord 授权页
             for _ in range(20):
                 sb.sleep(2)
-                # 直接跳转式登录是同标签重定向，不会开新窗口；
-                # 且 uc_open_with_reconnect 会短暂断开 driver，
-                # 绝不能碰 sb.driver.window_handles（原生 Selenium 命令，会 Connection refused）。
-                try:
-                    u = sb.get_current_url()
-                except Exception as e:
-                    log("WARN", f"get_current_url 抖动（重连窗口期），重试: {e}")
-                    continue
-
+                if len(sb.driver.window_handles) > 1:
+                    sb.switch_to_newest_window()
+                    
+                u = sb.get_current_url()
                 if "discord.com/oauth2/authorize" in u:
-                    authorized_seen = True
                     log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行终极滑动逻辑...")
                     # 1. 终极滑动（照搬参考脚本的最强滑动黑科技）
                     sb.execute_script("""
@@ -372,13 +365,9 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
                     # 2. 寻找并点击授权按钮（CDP 安全版：JS 文本匹配）
                     if js_click_by_text(sb, texts=["authorize", "授权"], tags=("button",)):
                         log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
-                    sb.sleep(3)   # 给重定向留时间
-                elif authorized_seen and "bot-hosting.net" in u and "oauth2" not in u:
-                    # 授权后会重定向回 bot-hosting.net/login?code=...（含 login），
-                    # 不能用 "login not in u" 判断，否则误判成没成功。
-                    # 只有在“进过授权页之后”再回到 bot-hosting 域名才算通过，
-                    # 避免刚跳转、还没到 discord 授权页时就误判成功。
-                    log("INFO", f"✓ 已离开 Discord 授权页，返回 bot-hosting: {u}")
+                    sb.sleep(2)
+                elif "bot-hosting.net" in u and "login" not in u:
+                    log("INFO", f"✓ OAuth 授权完成，成功返回面板: {u}")
                     oauth_success = True
                     break
             
