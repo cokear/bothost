@@ -39,7 +39,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.chrome-profile-discord
-          key: chrome-profile-discord-v1
+          key: chrome-profile-discord-v1-${{ github.run_id }}
+          restore-keys: |
+            chrome-profile-discord-v1-
           fail-on-cache-miss: false
 
       - name: 5. 清理 Chrome Profile 锁文件（防异常退出残留）
@@ -77,10 +79,3 @@ jobs:
             export BROWSER_PROXY="http://127.0.0.1:8080"
           fi
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python earn_with_cdk.py
-
-      - name: 8. 保存更新后的 Chrome Profile（含 Discord 登录态 + NopeCHA key）
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: ~/.chrome-profile-discord
-          key: chrome-profile-discord-v1
