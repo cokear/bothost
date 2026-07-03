@@ -1,0 +1,83 @@
+name: 🔑🪙 Bot-Hosting 自动续期 (纯 OAuth)
+
+on:
+  repository_dispatch:
+    types: [bot]
+  workflow_dispatch:
+
+concurrency:
+  group: bothosting-renew
+  cancel-in-progress: true
+
+jobs:
+  renew:
+    name: 🔑🪙 OAuth 登录并续期
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 1. 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U seleniumbase requests
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb xdotool
+          seleniumbase install chromedriver
+          seleniumbase install chrome
+          echo "✅ 依赖安装完成"
+
+      - name: 4. 还原 Chrome Profile（复用最新环境）
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1-${{ github.run_id }}
+          restore-keys: |
+            chrome-profile-discord-v1-
+          fail-on-cache-miss: false
+
+      - name: 5. 清理 Chrome Profile 锁文件（强制解锁防卡死）
+        run: |
+          rm -f ~/.chrome-profile-discord/SingletonLock
+          rm -f ~/.chrome-profile-discord/SingletonSocket
+          rm -f ~/.chrome-profile-discord/SingletonCookie
+          echo "✅ 锁文件清理完成"
+
+      - name: 6. 按需拉起代理（Sing-Box 隧道）
+        if: env.PROXY_STR != ''
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+        run: |
+          echo "✅ 检测到代理配置，正在拉起 Sing-Box..."
+          curl -LO https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
+          tar -xzf sing-box-1.9.3-linux-amd64.tar.gz
+          sudo cp sing-box-1.9.3-linux-amd64/sing-box /usr/local/bin/
+          python convert_proxy.py
+          nohup sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 3
+          curl -sS --socks5 127.0.0.1:8080 \
+            -o /dev/null -w "代理状态: %{http_code}\n" \
+            https://api.ipify.org || echo "⚠️ 代理可能未就绪，继续执行"
+
+      - name: 7. 执行自动续期脚本 (newbost.py)
+        env:
+          PROXY_STR:             ${{ secrets.PROXY_STR }}
+          NOPECHA_KEY:           ${{ secrets.NOPECHA_KEY }}
+          TG_BOT_TOKEN:          ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:            ${{ secrets.TG_CHAT_ID }}
+          BROWSER_USER_DATA_DIR: /home/runner/.chrome-profile-discord
+          NOPECHA_EXT_DIR:       ${{ github.workspace }}/chromium
+        run: |
+          if [ -n "$PROXY_STR" ]; then
+            export BROWSER_PROXY="http://127.0.0.1:8080"
+          fi
+          # 必须使用 xvfb-run，保证包含 xdotool 需要的虚拟桌面环境
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python newbost.py
