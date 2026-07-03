@@ -8,6 +8,7 @@ import random
 import subprocess
 import requests
 import traceback
+import sys
 from pathlib import Path
 from seleniumbase import SB
 
@@ -284,10 +285,13 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
         cur_url = sb.get_current_url()
         if "login" in cur_url:
             log("INFO", "当前在登录页，查找 Discord 登录按钮...")
-            discord_btn_xpath = "//a[contains(@href, 'discord') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'discord')] | //button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'discord')]"
+            # 兼容 SeleniumBase UC CDP 的纯 CSS 选择器！
+            discord_btn_css = 'a[href*="discord" i], button:contains("Discord"), a:contains("Discord")'
             try:
-                sb.wait_for_element_visible(discord_btn_xpath, by="xpath", timeout=10)
-                btn = sb.find_element(discord_btn_xpath, by="xpath")
+                sb.wait_for_element_visible(discord_btn_css, timeout=10)
+                btn = sb.find_element(discord_btn_css)
+                sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                sb.sleep(1)
                 sb.execute_script("arguments[0].click();", btn)
                 log("INFO", "✓ 已点击面板的 Discord 登录按钮")
             except Exception as e:
@@ -306,10 +310,12 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
                 u = sb.get_current_url()
                 if "discord.com/oauth2/authorize" in u:
                     log("INFO", "[OAuth] 拦截到 Discord 授权确认页，寻找【Authorize/授权】按钮...")
-                    auth_xpath = "//button[contains(., 'Authorize') or contains(., '授权')]"
+                    auth_css = 'button:contains("Authorize"), button:contains("授权")'
                     try:
-                        sb.wait_for_element_visible(auth_xpath, timeout=3)
-                        auth_btn = sb.find_element(auth_xpath, by="xpath")
+                        sb.wait_for_element_visible(auth_css, timeout=5)
+                        auth_btn = sb.find_element(auth_css)
+                        sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", auth_btn)
+                        sb.sleep(1)
                         sb.execute_script("arguments[0].click();", auth_btn)
                         log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
                         sb.sleep(2)
@@ -346,20 +352,16 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
 
         # ---------------- 找 Renew 按钮 ----------------
         log("INFO", f"\n=== [Step 4] 查找 '{RENEW_TEXT}' 按钮 ===")
-        xpath = (
-            f"//button[normalize-space()='{RENEW_TEXT}']"
-            f" | //a[normalize-space()='{RENEW_TEXT}']"
-            f" | //button[contains(normalize-space(), '{RENEW_TEXT}')]"
-        )
+        renew_css = f'button:contains("{RENEW_TEXT}"), a:contains("{RENEW_TEXT}")'
         try:
-            sb.wait_for_element_visible(xpath, by="xpath", timeout=15)
+            sb.wait_for_element_visible(renew_css, timeout=15)
         except Exception:
             log("INFO", f"✓ 15 秒内没找到 '{RENEW_TEXT}' 按钮，说明机器都已经续期满了")
             (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
             sb.save_screenshot(str(HERE / "page_debug.png"))
             return False, 0, cdk
 
-        buttons = sb.find_elements(xpath, by="xpath")
+        buttons = sb.find_elements(renew_css)
         total_buttons = len(buttons)
         log("INFO", f"✓ 找到 {total_buttons} 个按钮，准备点击")
 
@@ -368,11 +370,12 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
         clicked = 0
         for i in range(total_buttons):
             try:
-                btn_xpath = f"({xpath})[{i+1}]"
-                if not sb.is_element_present(btn_xpath, by="xpath"):
-                    continue
+                # 重新抓取元素，防止 StaleElement 报错
+                current_buttons = sb.find_elements(renew_css)
+                if i >= len(current_buttons):
+                    break
                 
-                btn = sb.find_element(btn_xpath, by="xpath")
+                btn = current_buttons[i]
                 text = (btn.text or "").strip()
                 enabled = btn.is_enabled()
                 log("INFO", f"[{i+1}/{total_buttons}] '{text}' enabled={enabled}")
@@ -381,6 +384,8 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
                     log("WARN", "  ⚠️  按钮 disabled，跳过")
                     continue
                 
+                sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                sb.sleep(0.5)
                 sb.execute_script("arguments[0].click();", btn)
                 clicked += 1
                 sb.sleep(COOLDOWN_BETWEEN_CLICKS)
