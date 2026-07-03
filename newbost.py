@@ -332,15 +332,10 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
             oauth_success = False
             for _ in range(20):
                 sb.sleep(2)
-                # 直接跳转式登录是同标签重定向，不会开新窗口；
-                # 且 uc_open_with_reconnect 会短暂断开 driver，
-                # 绝不能碰 sb.driver.window_handles（原生 Selenium 命令，会 Connection refused）。
-                try:
-                    u = sb.get_current_url()
-                except Exception as e:
-                    log("WARN", f"get_current_url 抖动（重连窗口期），重试: {e}")
-                    continue
-
+                if len(sb.driver.window_handles) > 1:
+                    sb.switch_to_newest_window()
+                    
+                u = sb.get_current_url()
                 if "discord.com/oauth2/authorize" in u:
                     log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行终极滑动逻辑...")
                     # 1. 终极滑动（照搬参考脚本的最强滑动黑科技）
