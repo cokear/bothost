@@ -196,7 +196,7 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                 if js_click_by_text(sb, texts=["authorize", "授权"], tags=("button",)):
                     log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
                 sb.sleep(3)   # 给重定向留时间
-            elif "bot-hosting.net" in u and "login" not in u:
+            elif "bot-hosting.net" in u and ("login" not in u or authorized_seen):
                 log("INFO", f"✓ 成功进入或返回面板 (URL: {u})")
                 oauth_success = True
                 break
