@@ -1,12 +1,10 @@
 """
-bot-hosting.net 自动续期 (纯正 OAuth 登录版 + 完整 CDK 领取逻辑)
+bot-hosting.net 自动续期 (纯正 OAuth 登录版)
 """
 import time
 import os
 import re
 import json
-import random
-import subprocess
 import requests
 import traceback
 import sys
@@ -21,10 +19,6 @@ PROFILE_DIR     = os.getenv("BROWSER_USER_DATA_DIR",
                             os.path.expanduser("~/.chrome-profile-discord"))
 NOPECHA_EXT_DIR = os.getenv("NOPECHA_EXT_DIR", 
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium"))
-
-# 提取 CDK 所需的 Discord 链接
-DISCORD_CHANNEL_URL = "https://discord.com/channels/1046086326077882479/1243188924520726538"
-DISCORD_DM_URL      = "https://discord.com/channels/@me/1514785932203528202"
 
 # 面板续期所需的链接
 HOME_URL     = "https://bot-hosting.net/"
@@ -95,11 +89,7 @@ def js_eval(sb, expr: str):
         return None
 
 def js_click_by_text(sb, texts, tags=("a", "button"), href_contains=None):
-    """CDP 模式下按可见文本 / href 找元素并 JS 点击，命中返回 True。
-
-    CDP 模式（uc=True）的选择器引擎不支持 :contains()，所以文本匹配
-    全部放到页面内 JS 里做，绕开 wait_for_element_visible / find_element。
-    """
+    """CDP 模式下按可见文本 / href 找元素并 JS 点击，命中返回 True。"""
     payload = {
         "texts": [t.lower() for t in texts],
         "tags": list(tags),
@@ -124,170 +114,16 @@ def js_click_by_text(sb, texts, tags=("a", "button"), href_contains=None):
         }
         return false;
     })()""".replace("__PAYLOAD__", json.dumps(payload))
-    # 注意：不能走 js_eval（它会在外层加 return，CDP 的 Runtime.evaluate
-    # 顶层不允许 return，会报 Illegal return statement）。IIFE 本身就是表达式，
-    # 直接 execute_script 求值即可。
     try:
         return bool(sb.execute_script(js))
     except Exception as e:
         log("WARN", f"js_click_by_text 失败: {e}")
         return False
 
-def xdo(args: list):
-    env = {**os.environ, "DISPLAY": DISPLAY}
-    subprocess.run(["xdotool"] + args, env=env,
-                   capture_output=True, check=False)
-
-def mouse_click(x: int, y: int, label: str = ""):
-    mid_x = x + random.randint(-30, 30)
-    mid_y = y + random.randint(-20, 20)
-    xdo(["mousemove", "--", str(mid_x), str(mid_y)])
-    time.sleep(random.uniform(0.1, 0.2))
-    xdo(["mousemove", "--", str(x), str(y)])
-    time.sleep(random.uniform(0.1, 0.25))
-    xdo(["mousedown", "1"])
-    time.sleep(random.uniform(0.08, 0.15))
-    xdo(["mouseup", "1"])
-    if label:
-        log("INFO", f"  🖱️ 点击 ({x},{y}) {label}")
-
-def keyboard_type(text: str):
-    env = {**os.environ, "DISPLAY": DISPLAY}
-    for ch in text:
-        subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "80", "--", ch],
-            env=env, capture_output=True
-        )
-        time.sleep(random.uniform(0.05, 0.15))
-
-def keyboard_key(key: str):
-    xdo(["key", "--clearmodifiers", key])
-    time.sleep(0.1)
-
-def get_element_screen_pos(sb, selector: str):
-    safe = selector.replace('"', '\\"')
-    info = js_eval(sb,
-        f'(function(){{'
-        f'  var el = document.querySelector("{safe}");'
-        f'  if (!el) return null;'
-        f'  var r = el.getBoundingClientRect();'
-        f'  return {{'
-        f'    "cx": r.left + r.width / 2,'
-        f'    "cy": r.top + r.height / 2,'
-        f'    "sx": window.screenX || 0,'
-        f'    "sy": window.screenY || 0,'
-        f'    "dh": window.outerHeight - window.innerHeight,'
-        f'    "dw": (window.outerWidth - window.innerWidth) / 2'
-        f'  }};'
-        f'}})()'
-    )
-    if not info:
-        return None, None
-    ox = int(info.get('sx', 0) + info.get('dw', 0))
-    oy = int(info.get('sy', 0) + info.get('dh', 0))
-    return int(info['cx']) + ox, int(info['cy']) + oy
-
-def get_page_text(sb) -> str:
-    result = js_eval(sb, "document.body.innerText")
-    return result or ""
-
-# ── CDK 获取主逻辑（从参考脚本搬运）───────────────────────────
-
-def extract_latest_cdk(text: str):
-    pattern = re.findall(
-        r'Here is your Discord key for NopeCHA[:\s]+([a-z0-9]+).*?\(([^)]+)\)',
-        text, re.IGNORECASE | re.DOTALL
-    )
-    if not pattern:
-        return '', False
-
-    cdk, time_label = pattern[-1]
-    is_recent = '内' in time_label
-    log("INFO", f"  📋 最新 CDK 时间标记: {time_label} | 24h内: {is_recent}")
-    return cdk, is_recent
-
-def inject_nopecha_key(sb, cdk: str):
-    log("INFO", f"💉 注入 key 到 NopeCHA 插件...")
-    sb.open(f"https://nopecha.com/setup#{cdk}")
-    time.sleep(3)
-    log("INFO", f"✅ key 注入完成: {cdk[:4]}****{cdk[-4:]}")
-
-def send_command_and_poll(sb) -> str:
-    sb.open(DISCORD_CHANNEL_URL)
-    time.sleep(3)
-
-    log("INFO", "🖱️ 定位消息输入框...")
-    ix, iy = get_element_screen_pos(sb, '[data-slate-editor="true"]')
-    if not ix:
-        log("ERROR", "❌ 找不到 Discord 输入框")
-        return ''
-
-    mouse_click(ix, iy, "输入框")
-    time.sleep(random.uniform(0.5, 1.0))
-
-    log("INFO", "⌨️ 输入 !nopecha...")
-    keyboard_key("ctrl+a")
-    time.sleep(0.2)
-    keyboard_type("!nopecha")
-    time.sleep(random.uniform(0.4, 0.8))
-    keyboard_key("Return")
-
-    log("INFO", "✅ 命令已发送，等待私聊回复...")
-    time.sleep(5)
-
-    for attempt in range(20):
-        time.sleep(3)
-        log("INFO", f"  [{attempt*3+3}s] 打开私聊检查...")
-
-        sb.open(DISCORD_DM_URL)
-        time.sleep(5)
-
-        page_text = get_page_text(sb)
-        if page_text:
-            cdk, is_recent = extract_latest_cdk(page_text)
-            if cdk and is_recent:
-                log("INFO", f"✅ 提取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
-                return cdk
-
-        sb.open(DISCORD_CHANNEL_URL)
-        time.sleep(2)
-
-    return ''
-
-def ensure_cdk(sb) -> str:
-    log("INFO", "=" * 50)
-    log("INFO", "🔑 开始 CDK 检查流程")
-    log("INFO", "=" * 50)
-
-    if "login" in sb.get_current_url().lower():
-        log("WARN", "Discord 似乎未登录，直接去尝试后续步骤")
-        return ''
-
-    log("INFO", "🔍 检查私聊是否已有24h内的 CDK...")
-    sb.open(DISCORD_DM_URL)
-    time.sleep(5)
-
-    page_text = get_page_text(sb)
-    cdk, is_recent = extract_latest_cdk(page_text) if page_text else ('', False)
-
-    if cdk and is_recent:
-        log("INFO", f"✅ 已有24h内的 CDK，直接注入，无需发送命令: {cdk[:4]}****{cdk[-4:]}")
-        inject_nopecha_key(sb, cdk)
-        return cdk
-
-    log("INFO", "📭 无24h内的 CDK，去频道发送命令领取新的...")
-    cdk = send_command_and_poll(sb)
-
-    if not cdk:
-        log("WARN", "❌ 未能获取 CDK，插件可能无法正常工作")
-        return ''
-
-    inject_nopecha_key(sb, cdk)
-    return cdk
 
 # ── bot-hosting 续期主逻辑 ──────────────────────────────
 
-def do_renew(proxy: str | None) -> tuple[bool, int, str]:
+def do_renew(proxy: str | None) -> tuple[bool, int]:
     if not PROFILE_DIR:
         log("WARN", "未配置 BROWSER_USER_DATA_DIR，未加载持久化 Profile！")
     
@@ -310,32 +146,20 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
     with SB(**sb_kwargs) as sb:
         sb.driver.set_page_load_timeout(60)
 
-        # ---------------- 注入 CDK ----------------
-        global DISPLAY
-        DISPLAY = os.environ.get("DISPLAY", DISPLAY)
-        sb.open("https://discord.com/app")
-        time.sleep(5)
-        cdk = ensure_cdk(sb)
-
         # ---------------- OAuth 登录 ----------------
-        log("INFO", "\n=== [Step 2] 打开登录页，尝试使用 Discord 一键登录 ===")
-        sb.uc_open_with_reconnect(LOGIN_URL, 4)
+        log("INFO", "\n=== [Step 1] 打开登录页，尝试使用 Discord 一键登录 ===")
+        # 登录页有固定链接 <a href="/login/discord">Continue with Discord</a>，
+        # 直接开这个 URL 等价于点它，最稳。
+        log("INFO", "直接跳转 Discord OAuth 入口 /login/discord ...")
+        sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", 4)
         sb.sleep(4)
         
         cur_url = sb.get_current_url()
         if "login" in cur_url and "oauth2" not in cur_url:
-            # 登录页有固定链接 <a href="/login/discord">Continue with Discord</a>，
-            # 带 data-sveltekit-reload（整页跳转），直接开这个 URL 等价于点它，最稳。
-            log("INFO", "直接跳转 Discord OAuth 入口 /login/discord ...")
-            sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", 4)
-            sb.sleep(4)
             oauth_success = False
             authorized_seen = False   # 是否已经进过 Discord 授权页
             for _ in range(20):
                 sb.sleep(2)
-                # 直接跳转式登录是同标签重定向，不会开新窗口；
-                # 且 uc_open_with_reconnect 会短暂断开 driver，
-                # 绝不能碰 sb.driver.window_handles（原生 Selenium 命令，会 Connection refused）。
                 try:
                     u = sb.get_current_url()
                 except Exception as e:
@@ -374,10 +198,6 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
                         log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
                     sb.sleep(3)   # 给重定向留时间
                 elif authorized_seen and "bot-hosting.net" in u and "oauth2" not in u:
-                    # 授权后会重定向回 bot-hosting.net/login?code=...（含 login），
-                    # 不能用 "login not in u" 判断，否则误判成没成功。
-                    # 只有在“进过授权页之后”再回到 bot-hosting 域名才算通过，
-                    # 避免刚跳转、还没到 discord 授权页时就误判成功。
                     log("INFO", f"✓ 已离开 Discord 授权页，返回 bot-hosting: {u}")
                     oauth_success = True
                     break
@@ -390,7 +210,7 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
             log("INFO", f"✓ 似乎已经处于登录状态 (URL: {cur_url})")
 
         # ---------------- 跳转 Billings ----------------
-        log("INFO", f"\n=== [Step 3] 跳转 {BILLINGS_URL} ===")
+        log("INFO", f"\n=== [Step 2] 跳转 {BILLINGS_URL} ===")
         sb.uc_open_with_reconnect(BILLINGS_URL, 4)
         sb.sleep(5)
         
@@ -407,7 +227,7 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
         log("INFO", "✓ 成功进入续期页面！")
 
         # ---------------- 找 Renew 按钮 ----------------
-        log("INFO", f"\n=== [Step 4] 查找 '{RENEW_TEXT}' 按钮 ===")
+        log("INFO", f"\n=== [Step 3] 查找 '{RENEW_TEXT}' 按钮 ===")
         renew_css = f'button:contains("{RENEW_TEXT}"), a:contains("{RENEW_TEXT}")'
         try:
             sb.wait_for_element_visible(renew_css, timeout=15)
@@ -415,14 +235,14 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
             log("INFO", f"✓ 15 秒内没找到 '{RENEW_TEXT}' 按钮，说明机器都已经续期满了")
             (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
             sb.save_screenshot(str(HERE / "page_debug.png"))
-            return False, 0, cdk
+            return False, 0
 
         buttons = sb.find_elements(renew_css)
         total_buttons = len(buttons)
         log("INFO", f"✓ 找到 {total_buttons} 个按钮，准备点击")
 
         # ---------------- 逐个强制 JS 点击 ----------------
-        log("INFO", "\n=== [Step 5] 逐个点击 Renew 按钮 ===")
+        log("INFO", "\n=== [Step 4] 逐个点击 Renew 按钮 ===")
         clicked = 0
         for i in range(total_buttons):
             try:
@@ -460,7 +280,7 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
 
         sb.save_screenshot(str(HERE / "after_renew.png"))
         log("INFO", f"\n✅ 共点击 {clicked} 个 Renew 按钮")
-        return clicked > 0, clicked, cdk
+        return clicked > 0, clicked
 
 # ============ 入口 ============
 
@@ -474,7 +294,7 @@ def main():
     )
 
     try:
-        success, clicked, cdk = do_renew(proxy)
+        success, clicked = do_renew(proxy)
     except Exception as e:
         tb = traceback.format_exc()
         log("ERROR", tb)
@@ -485,15 +305,13 @@ def main():
 
     if success:
         tg_text(
-            f"✅ <b>bot-hosting renew</b>\n成功，点击了 {clicked} 个机器\n"
-            f"🔑 CDK: {cdk[:4]}****{cdk[-4:]}"
+            f"✅ <b>bot-hosting renew</b>\n成功，点击了 {clicked} 个机器"
         )
         tg_file(HERE / "after_renew.png", f"after_renew ({clicked} clicks)", "photo")
         sys.exit(0)
     else:
         tg_text(
-            f"🎉 <b>bot-hosting renew</b>\n没找到可点的 Renew，大概率都已经续满啦！\n"
-            f"🔑 CDK: {cdk[:4]}****{cdk[-4:]}"
+            f"🎉 <b>bot-hosting renew</b>\n没找到可点的 Renew，大概率都已经续满啦！"
         )
         tg_file(HERE / "page_debug.png", "page_debug", "photo")
         sys.exit(0)
