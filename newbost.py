@@ -285,8 +285,8 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
         cur_url = sb.get_current_url()
         if "login" in cur_url:
             log("INFO", "当前在登录页，查找 Discord 登录按钮...")
-            # 兼容 SeleniumBase UC CDP 的纯 CSS 选择器！
-            discord_btn_css = 'a[href*="discord" i], button:contains("Discord"), a:contains("Discord")'
+            # 兼容 SeleniumBase UC CDP 的纯 CSS 选择器（注意不能用 cssselect 不支持的 i 标志）
+            discord_btn_css = 'a[href*="discord"], button:contains("Discord"), a:contains("Discord")'
             try:
                 sb.wait_for_element_visible(discord_btn_css, timeout=10)
                 btn = sb.find_element(discord_btn_css)
@@ -309,18 +309,52 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
                     
                 u = sb.get_current_url()
                 if "discord.com/oauth2/authorize" in u:
-                    log("INFO", "[OAuth] 拦截到 Discord 授权确认页，寻找【Authorize/授权】按钮...")
-                    auth_css = 'button:contains("Authorize"), button:contains("授权")'
-                    try:
-                        sb.wait_for_element_visible(auth_css, timeout=5)
-                        auth_btn = sb.find_element(auth_css)
-                        sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", auth_btn)
-                        sb.sleep(1)
-                        sb.execute_script("arguments[0].click();", auth_btn)
-                        log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
-                        sb.sleep(2)
-                    except Exception:
-                        pass
+                    log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行终极滑动逻辑...")
+                    # 1. 终极滑动（照搬参考脚本的最强滑动黑科技）
+                    sb.execute_script("""
+                        const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
+                            '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
+                            'div[class*="modal"] div[style*="overflow"]','div[class*="root"] div[style*="overflow"]'];
+                        let scrolled = false;
+                        for (const sel of sels) {
+                            for (const el of document.querySelectorAll(sel)) {
+                                const s = getComputedStyle(el);
+                                if (el.scrollHeight > el.clientHeight &&
+                                    ['auto','scroll'].some(v => s.overflowY === v || s.overflow === v))
+                                    { el.scrollTop = el.scrollHeight; scrolled = true; }
+                            }
+                        }
+                        if (!scrolled) document.querySelectorAll('div').forEach(el => {
+                            if (el.scrollHeight > el.clientHeight + 10) {
+                                const s = getComputedStyle(el);
+                                if (['auto','scroll','hidden'].includes(s.overflowY)) el.scrollTop = el.scrollHeight;
+                            }
+                        });
+                        scrollTo(0, document.body.scrollHeight);
+                    """)
+                    sb.sleep(1.5)
+                    
+                    # 2. 寻找并点击授权按钮（照搬参考脚本的容错循环）
+                    clicked = False
+                    for sel in ['button:contains("Authorize")', 'button:contains("授权")', 'button[type="submit"]', 'div[class*="footer"] button', 'button[class*="primary"]']:
+                        try:
+                            elements = sb.find_elements(sel)
+                            # 从后往前找，通常主按钮在最后
+                            for btn in reversed(elements):
+                                if not btn.is_displayed():
+                                    continue
+                                text = (btn.text or "").strip().lower()
+                                if any(k in text for k in ("取消", "cancel", "deny")):
+                                    continue
+                                sb.execute_script("arguments[0].click();", btn)
+                                log("INFO", f"[OAuth] ✓ 成功点击 Discord 授权按钮！(命中: {sel})")
+                                clicked = True
+                                break
+                            if clicked:
+                                break
+                        except Exception:
+                            continue
+                    sb.sleep(2)
                 elif "bot-hosting.net" in u and "login" not in u:
                     log("INFO", f"✓ OAuth 授权完成，成功返回面板: {u}")
                     oauth_success = True
