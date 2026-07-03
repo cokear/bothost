@@ -88,16 +88,11 @@ def tg_file(path: str | Path, caption: str = "", kind: str = "document") -> None
 # ── JS 与外设操作 ─────────────────────────────────────────
 
 def js_eval(sb, expr: str):
-    # CDP 模式（uc=True）下脚本走 Runtime.evaluate（表达式求值），
-    # 顶层不允许 return，"return (...)" 会报 Illegal return statement 并返回 None。
-    # 经典 Selenium 模式下则必须带 return。这里两种写法都试，谁能过用谁。
-    for wrapped in (f"({expr})", f"return ({expr})"):
-        try:
-            return sb.execute_script(wrapped)
-        except Exception:
-            continue
-    log("WARN", f"js_eval 两种写法都失败: {expr[:80]}...")
-    return None
+    try:
+        return sb.execute_script(f"return ({expr})")
+    except Exception as e:
+        log("WARN", f"js_eval 失败: {e}")
+        return None
 
 def js_click_by_text(sb, texts, tags=("a", "button"), href_contains=None):
     """CDP 模式下按可见文本 / href 找元素并 JS 点击，命中返回 True。
@@ -196,26 +191,6 @@ def get_page_text(sb) -> str:
     result = js_eval(sb, "document.body.innerText")
     return result or ""
 
-def wait_for_page_text(sb, timeout=25, min_len=20, must_contain=None):
-    """轮询等 document.body.innerText 真正加载出来，避免读空导致误判。
-
-    - timeout: 最多等多少秒
-    - min_len: 文本至少多长才算“加载出来了”
-    - must_contain: 若给定，文本里出现这个子串才算就绪（比如 CDK 关键词）
-    返回最后拿到的文本（可能仍为空，交给调用方判断）。
-    """
-    end = time.time() + timeout
-    last = ""
-    while time.time() < end:
-        t = js_eval(sb, "document.body.innerText") or ""
-        last = t
-        if len(t.strip()) >= min_len and (must_contain is None or must_contain in t):
-            return t
-        time.sleep(1)
-    log("WARN", f"wait_for_page_text 超时，最后文本长度={len(last.strip())}")
-    return last
-
-
 # ── CDK 获取主逻辑（从参考脚本搬运）───────────────────────────
 
 def extract_latest_cdk(text: str):
@@ -239,16 +214,10 @@ def inject_nopecha_key(sb, cdk: str):
 
 def send_command_and_poll(sb) -> str:
     sb.open(DISCORD_CHANNEL_URL)
-    # 等频道页真正加载出来再找输入框，避免页面没渲染完就读坐标读到空。
-    wait_for_page_text(sb, timeout=25, min_len=20)
+    time.sleep(3)
 
     log("INFO", "🖱️ 定位消息输入框...")
-    ix, iy = None, None
-    for _ in range(10):
-        ix, iy = get_element_screen_pos(sb, '[data-slate-editor="true"]')
-        if ix:
-            break
-        time.sleep(1.5)
+    ix, iy = get_element_screen_pos(sb, '[data-slate-editor="true"]')
     if not ix:
         log("ERROR", "❌ 找不到 Discord 输入框")
         return ''
@@ -271,8 +240,10 @@ def send_command_and_poll(sb) -> str:
         log("INFO", f"  [{attempt*3+3}s] 打开私聊检查...")
 
         sb.open(DISCORD_DM_URL)
-        page_text = wait_for_page_text(sb, timeout=20, min_len=20)
-        if page_text.strip():
+        time.sleep(5)
+
+        page_text = get_page_text(sb)
+        if page_text:
             cdk, is_recent = extract_latest_cdk(page_text)
             if cdk and is_recent:
                 log("INFO", f"✅ 提取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
@@ -293,22 +264,11 @@ def ensure_cdk(sb) -> str:
         return ''
 
     log("INFO", "🔍 检查私聊是否已有24h内的 CDK...")
+    sb.open(DISCORD_DM_URL)
+    time.sleep(5)
 
-    # 读取抖动防护：Discord 私聊页有时没渲染完就被读，innerText 为空会误判“无 CDK”。
-    # 这里多开几次、每次等文本真正加载出来再判，避免读空。
-    cdk, is_recent = '', False
-    for attempt in range(3):
-        sb.open(DISCORD_DM_URL)
-        page_text = wait_for_page_text(sb, timeout=25, min_len=20)
-        if not page_text.strip():
-            log("WARN", f"  第 {attempt+1}/3 次：私聊页读回空文本，重试...")
-            time.sleep(3)
-            continue
-        cdk, is_recent = extract_latest_cdk(page_text)
-        if cdk:
-            break
-        log("INFO", f"  第 {attempt+1}/3 次：读到文本但没匹配到 CDK")
-        time.sleep(2)
+    page_text = get_page_text(sb)
+    cdk, is_recent = extract_latest_cdk(page_text) if page_text else ('', False)
 
     if cdk and is_recent:
         log("INFO", f"✅ 已有24h内的 CDK，直接注入，无需发送命令: {cdk[:4]}****{cdk[-4:]}")
