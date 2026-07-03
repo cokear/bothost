@@ -21,7 +21,7 @@ NOPECHA_EXT_DIR = os.getenv("NOPECHA_EXT_DIR",
 
 # 提取 CDK 所需的 Discord 链接
 DISCORD_CHANNEL_URL = "https://discord.com/channels/1046086326077882479/1243188924520726538"
-DISCORD_DM_URL      = "https://discord.com/channels/@me/1519516877074731018"
+DISCORD_DM_URL      = "https://discord.com/channels/@me/1514785932203528202"
 
 # 面板续期所需的链接
 HOME_URL     = "https://bot-hosting.net/"
