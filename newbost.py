@@ -134,7 +134,6 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
         xvfb=True,
         locale="en",
         user_data_dir=PROFILE_DIR if PROFILE_DIR else None,
-        extension_dir=NOPECHA_EXT_DIR if NOPECHA_EXT_DIR else None,
         chromium_arg="--disable-dev-shm-usage,--no-sandbox,--window-size=1366,768",
     )
     if proxy:
@@ -234,9 +233,14 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
             sb.save_screenshot(str(HERE / "page_debug.png"))
             return False, 0
 
-        # 如果页面有 Cloudflare Turnstile，等待 NopeCHA 插件自动解决
-        log("INFO", "⏳ 预留 15 秒钟等待可能存在的人机验证自动打勾...")
-        sb.sleep(15)
+        # 用 UC 模式原生方法点 Cloudflare Turnstile 复选框
+        log("INFO", "🛡️ 尝试用 UC 模式点击 Cloudflare Turnstile 验证框...")
+        try:
+            sb.uc_gui_click_captcha()
+            log("INFO", "✅ Turnstile 验证已点击，等待解锁...")
+        except Exception as e:
+            log("WARN", f"uc_gui_click_captcha 未触发（可能不需要验证）: {e}")
+        sb.sleep(5)  # 等待验证结果生效
 
         buttons = sb.find_elements(renew_css)
         total_buttons = len(buttons)
