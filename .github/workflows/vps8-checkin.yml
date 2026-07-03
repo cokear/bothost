@@ -3,7 +3,7 @@ name: 🔐🎯 VPS8 每日签到（Nodeloc 登录 + NopeCHA）
 on:
 
   repository_dispatch:
-    types: [vps8]
+    types: [vp]
   workflow_dispatch:
 
 concurrency:
