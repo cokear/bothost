@@ -4,6 +4,7 @@ bot-hosting.net 自动续期 (纯正 OAuth 登录版 + 完整 CDK 领取逻辑)
 import time
 import os
 import re
+import json
 import random
 import subprocess
 import requests
@@ -92,6 +93,38 @@ def js_eval(sb, expr: str):
     except Exception as e:
         log("WARN", f"js_eval 失败: {e}")
         return None
+
+def js_click_by_text(sb, texts, tags=("a", "button"), href_contains=None):
+    """CDP 模式下按可见文本 / href 找元素并 JS 点击，命中返回 True。
+
+    CDP 模式（uc=True）的选择器引擎不支持 :contains()，所以文本匹配
+    全部放到页面内 JS 里做，绕开 wait_for_element_visible / find_element。
+    """
+    payload = {
+        "texts": [t.lower() for t in texts],
+        "tags": list(tags),
+        "href": (href_contains or "").lower(),
+    }
+    js = """(function(){
+        var cfg = __PAYLOAD__;
+        var els = [];
+        cfg.tags.forEach(function(tag){
+            document.querySelectorAll(tag).forEach(function(e){ els.push(e); });
+        });
+        for (var i = els.length - 1; i >= 0; i--) {
+            var e = els[i];
+            var r = e.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            var txt  = (e.innerText || e.textContent || '').trim().toLowerCase();
+            var href = (e.getAttribute('href') || '').toLowerCase();
+            var hit = false;
+            if (cfg.href && href.indexOf(cfg.href) !== -1) hit = true;
+            if (!hit) cfg.texts.forEach(function(t){ if (t && txt.indexOf(t) !== -1) hit = true; });
+            if (hit) { e.scrollIntoView({block:'center'}); e.click(); return true; }
+        }
+        return false;
+    })()""".replace("__PAYLOAD__", json.dumps(payload))
+    return bool(js_eval(sb, js))
 
 def xdo(args: list):
     env = {**os.environ, "DISPLAY": DISPLAY}
@@ -284,18 +317,22 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
         
         cur_url = sb.get_current_url()
         if "login" in cur_url:
-            log("INFO", "当前在登录页，查找 Discord 登录按钮...")
-            # 兼容 SeleniumBase UC CDP 的纯 CSS 选择器（注意不能用 cssselect 不支持的 i 标志）
-            discord_btn_css = 'a[href*="discord"], button:contains("Discord"), a:contains("Discord")'
-            try:
-                sb.wait_for_element_visible(discord_btn_css, timeout=10)
-                btn = sb.find_element(discord_btn_css)
-                sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+            # === 登录按钮定位（CDP 安全版：JS 文本 / href 匹配，不用 :contains()） ===
+            log("INFO", "当前在登录页，用 JS 文本匹配查找 Discord 登录按钮...")
+            ok = False
+            for _ in range(10):
+                if js_click_by_text(
+                    sb,
+                    texts=["discord", "sign in with", "login with", "continue with"],
+                    href_contains="discord",
+                ):
+                    log("INFO", "✓ 已点击 Discord 登录按钮")
+                    ok = True
+                    break
                 sb.sleep(1)
-                sb.execute_script("arguments[0].click();", btn)
-                log("INFO", "✓ 已点击面板的 Discord 登录按钮")
-            except Exception as e:
-                log("ERROR", f"找不到 Discord 登录按钮: {e}")
+
+            if not ok:
+                log("ERROR", "找不到 Discord 登录按钮")
                 (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
                 sb.save_screenshot(str(HERE / "page_debug.png"))
                 raise RuntimeError("登录页找不到 Discord 按钮")
@@ -334,26 +371,9 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
                     """)
                     sb.sleep(1.5)
                     
-                    # 2. 寻找并点击授权按钮（照搬参考脚本的容错循环）
-                    clicked = False
-                    for sel in ['button:contains("Authorize")', 'button:contains("授权")', 'button[type="submit"]', 'div[class*="footer"] button', 'button[class*="primary"]']:
-                        try:
-                            elements = sb.find_elements(sel)
-                            # 从后往前找，通常主按钮在最后
-                            for btn in reversed(elements):
-                                if not btn.is_displayed():
-                                    continue
-                                text = (btn.text or "").strip().lower()
-                                if any(k in text for k in ("取消", "cancel", "deny")):
-                                    continue
-                                sb.execute_script("arguments[0].click();", btn)
-                                log("INFO", f"[OAuth] ✓ 成功点击 Discord 授权按钮！(命中: {sel})")
-                                clicked = True
-                                break
-                            if clicked:
-                                break
-                        except Exception:
-                            continue
+                    # 2. 寻找并点击授权按钮（CDP 安全版：JS 文本匹配）
+                    if js_click_by_text(sb, texts=["authorize", "授权"], tags=("button",)):
+                        log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
                     sb.sleep(2)
                 elif "bot-hosting.net" in u and "login" not in u:
                     log("INFO", f"✓ OAuth 授权完成，成功返回面板: {u}")
