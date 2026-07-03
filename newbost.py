@@ -124,7 +124,14 @@ def js_click_by_text(sb, texts, tags=("a", "button"), href_contains=None):
         }
         return false;
     })()""".replace("__PAYLOAD__", json.dumps(payload))
-    return bool(js_eval(sb, js))
+    # 注意：不能走 js_eval（它会在外层加 return，CDP 的 Runtime.evaluate
+    # 顶层不允许 return，会报 Illegal return statement）。IIFE 本身就是表达式，
+    # 直接 execute_script 求值即可。
+    try:
+        return bool(sb.execute_script(js))
+    except Exception as e:
+        log("WARN", f"js_click_by_text 失败: {e}")
+        return False
 
 def xdo(args: list):
     env = {**os.environ, "DISPLAY": DISPLAY}
@@ -316,28 +323,12 @@ def do_renew(proxy: str | None) -> tuple[bool, int, str]:
         sb.sleep(4)
         
         cur_url = sb.get_current_url()
-        if "login" in cur_url:
-            # === 登录按钮定位（CDP 安全版：JS 文本 / href 匹配，不用 :contains()） ===
-            log("INFO", "当前在登录页，用 JS 文本匹配查找 Discord 登录按钮...")
-            ok = False
-            for _ in range(10):
-                if js_click_by_text(
-                    sb,
-                    texts=["discord", "sign in with", "login with", "continue with"],
-                    href_contains="discord",
-                ):
-                    log("INFO", "✓ 已点击 Discord 登录按钮")
-                    ok = True
-                    break
-                sb.sleep(1)
-
-            if not ok:
-                log("ERROR", "找不到 Discord 登录按钮")
-                (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
-                sb.save_screenshot(str(HERE / "page_debug.png"))
-                raise RuntimeError("登录页找不到 Discord 按钮")
-
-            log("INFO", "正在监听跳转流程...")
+        if "login" in cur_url and "oauth2" not in cur_url:
+            # 登录页有固定链接 <a href="/login/discord">Continue with Discord</a>，
+            # 带 data-sveltekit-reload（整页跳转），直接开这个 URL 等价于点它，最稳。
+            log("INFO", "直接跳转 Discord OAuth 入口 /login/discord ...")
+            sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", 4)
+            sb.sleep(4)
             oauth_success = False
             for _ in range(20):
                 sb.sleep(2)
