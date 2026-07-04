@@ -17,6 +17,9 @@ BASE_URL   = os.getenv("BASE_URL", "https://vps8.zz.cd")
 LOGIN_URL  = os.getenv("LOGIN_URL", f"{BASE_URL}/login")
 SIGNIN_URL = os.getenv("SIGNIN_URL", f"{BASE_URL}/points/signin")
 
+# 签到 AJAX 接口（用于拦截返回，判断真实结果）
+SIGNIN_API_HINT = os.getenv("SIGNIN_API_HINT", "/points/signin")
+
 # 第三方登录方式: github / google / nodeloc
 LOGIN_PROVIDER = os.getenv("LOGIN_PROVIDER", "nodeloc").strip().lower()
 PROVIDER_LOGIN_URLS = {
@@ -46,7 +49,7 @@ DISCORD_CHANNEL_URL = os.getenv(
 )
 DISCORD_DM_URL = os.getenv(
     "DISCORD_DM_URL",
-    "https://discord.com/channels/@me/1514785932203528202",
+    "https://discord.com/channels/@me/1519516877074731018",
 )
 
 SS_DIR = os.getenv("SS_DIR", "screenshots")
@@ -84,7 +87,7 @@ def mask_ip(ip):
     parts = value.split(".")  # IPv4
     if len(parts) == 4:
         return f"{parts[0]}.{parts[1]}.*.*"
-    return value[:-2] + "**" if len(value) >= 2 else "**"
+    return "***"  # 非法格式，直接全脱敏
 
 
 def mask_proxy(proxy):
@@ -222,7 +225,6 @@ def keyboard_type(text):
             ["xdotool", "type", "--clearmodifiers", "--delay", "80", "--", ch],
             env=env, capture_output=True,
         )
-        time.sleep(random.uniform(0.05, 0.15))
 
 
 def keyboard_key(key):
@@ -259,26 +261,18 @@ def get_page_text(sb):
 
 
 def open_and_wait(sb, url, must_contain=None, timeout=25, settle=6, min_len=50):
-    """打开 URL 并等待内容真正加载出来，缓解慢网络下过早检测导致的误判。
-
-    - settle: 打开后先等待的秒数，给重型 SPA（如 Discord）渲染时间，
-      避免过早调用 execute_script 触发 "script timeout"
-    - must_contain: 页面文本需包含的关键字（如 "NopeCHA"）；命中即返回
-    - 否则等待文本长度达到 min_len 视为已加载
-    返回最后一次读取到的页面文本。
-    """
+    """打开 URL 并等待内容真正加载出来，缓解慢网络下过早检测导致的误判。"""
     try:
         sb.open(url)
     except Exception as e:
         log("WARN", f"打开 {url} 失败: {e}")
 
-    # 先给重型 SPA 一点渲染时间，避免过早 execute_script 卡死
     time.sleep(settle)
 
     end = time.time() + timeout
     last = ""
     while time.time() < end:
-        txt = get_page_text(sb)  # js_eval 内部已 try/except，超时返回 ""
+        txt = get_page_text(sb)
         last = txt
         if must_contain:
             if must_contain in txt:
@@ -292,15 +286,10 @@ def open_and_wait(sb, url, must_contain=None, timeout=25, settle=6, min_len=50):
 # ── NopeCHA CDK 领取 & 注入 ───────────────────────────────
 
 def extract_latest_cdk(text):
-    """从 Discord 私信文本里提取最新一条 NopeCHA CDK，并判断是否 24h 内。
-
-    注意：key 提取与时间标记解析解耦，避免因括号/文案变化整体匹配失败。
-    时间标记兼容中英文括号 ( ) （ ）。
-    """
+    """从 Discord 私信文本里提取最新一条 NopeCHA CDK，并判断是否 24h 内。"""
     if not text:
         return "", False
 
-    # 1) 先独立提取所有 key，取最后一条（最新）
     keys = re.findall(
         r"Here is your Discord key for NopeCHA[:\s]+([A-Za-z0-9]{6,})",
         text, re.IGNORECASE,
@@ -309,7 +298,6 @@ def extract_latest_cdk(text):
         return "", False
     cdk = keys[-1]
 
-    # 2) 在该 key 之后查找括号内的时间标记（兼容半角/全角括号）
     m = re.search(
         re.escape(cdk) + r".*?[\(（]([^\)）]+)[\)）]",
         text, re.IGNORECASE | re.DOTALL,
@@ -336,7 +324,6 @@ def send_command_and_poll(sb):
 
     log("INFO", "🖱️ 定位消息输入框...")
     editor_sel = '[data-slate-editor="true"]'
-    # 显式等输入框元素出现（Discord 加载慢），再多次重试拿屏幕坐标
     try:
         sb.wait_for_element_present(editor_sel, timeout=25)
     except Exception:
@@ -371,10 +358,8 @@ def send_command_and_poll(sb):
         time.sleep(3)
         log("INFO", f"  [{attempt*3+3}s] 打开私聊检查...")
 
-        # 等私信里真正出现 key 消息正文再解析（侧边栏只有机器人名，不足以判定已加载）
         page_text = open_and_wait(sb, DISCORD_DM_URL, must_contain="Here is your Discord key", timeout=15)
         if page_text:
-            # 刚发完命令，私信里最新一条即为新 key，只要提取到就接受
             cdk, _is_recent = extract_latest_cdk(page_text)
             if cdk:
                 log("INFO", f"✅ 提取到 CDK: {cdk[:4]}****{cdk[-4:]}")
@@ -387,21 +372,18 @@ def send_command_and_poll(sb):
 
 
 def ensure_cdk(sb):
-    """
-    确保 NopeCHA 插件有可用 key。
+    """确保 NopeCHA 插件有可用 key。
     优先级: 环境变量 NOPECHA_KEY > 私信 24h 内旧 CDK > 发命令领新 CDK。
     """
     log("INFO", "=" * 50)
     log("INFO", "🔑 开始 CDK 检查流程")
     log("INFO", "=" * 50)
 
-    # 0) 显式配置了 key，直接注入
     if NOPECHA_KEY:
         log("INFO", "使用环境变量 NOPECHA_KEY，跳过 Discord 领取")
         inject_nopecha_key(sb, NOPECHA_KEY)
         return NOPECHA_KEY
 
-    # 1) 打开 Discord，确认登录态
     open_and_wait(sb, DISCORD_CHANNEL_URL, timeout=20)
     try:
         cur = sb.get_current_url().lower()
@@ -413,19 +395,22 @@ def ensure_cdk(sb):
         send_tg_text(TG_TOKEN, TG_CHAT_ID, f"VPS8 签到失败: {msg}")
         return ""
 
-    # 2) 私信里找 24h 内的旧 CDK
     log("INFO", "🔍 检查私聊是否已有24h内的 CDK...")
     page_text = open_and_wait(sb, DISCORD_DM_URL, must_contain="Here is your Discord key", timeout=25)
     log("INFO", f"  (DM 文本长度: {len(page_text or '')})")
     cdk, is_recent = extract_latest_cdk(page_text) if page_text else ("", False)
 
+    # 有旧 key：不管时间标记是否可解析，先尝试直接注入复用，避免频繁发命令被限流
     if cdk and is_recent:
         log("INFO", f"✅ 已有24h内的 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
         inject_nopecha_key(sb, cdk)
         return cdk
+    if cdk and not is_recent:
+        log("INFO", f"⚠️ 时间标记判不出/超24h，先尝试复用旧 CDK: {cdk[:4]}****{cdk[-4:]}")
+        inject_nopecha_key(sb, cdk)
+        return cdk
 
-    # 3) 去频道发命令领新的
-    log("INFO", "📭 无24h内的 CDK，去频道发送命令领取...")
+    log("INFO", "📭 私信无可用 CDK，去频道发送命令领取...")
     cdk = send_command_and_poll(sb)
     if not cdk:
         msg = "❌ 未能获取 CDK，请检查 Discord"
@@ -440,19 +425,12 @@ def ensure_cdk(sb):
 # ── 页面状态解析 ──────────────────────────────────────────
 
 def is_signed(html):
+    """仅信任明确状态，删除模糊分支，宁可漏判也不错判。"""
     m = re.search(r"今日签到状态：\s*([^\n<]+)", html)
     if m:
-        status = m.group(1).strip()
-        if status == "已签到":
-            return True
-        if status == "未签到":
-            return False
-
-    if "签到成功" in html and "今日签到状态" not in html:
-        return True
-    if "未签到" not in html and "当前连续签到" in html:
-        return True
-    return False
+        return m.group(1).strip() == "已签到"
+    # 兜底：明确的成功文案
+    return "签到成功" in html
 
 
 def extract_points(html):
@@ -647,6 +625,88 @@ def login_via_oauth(sb):
 
 # ── 签到 ──────────────────────────────────────────────────
 
+# 在点击前注入的 XHR/fetch 拦截脚本，把签到接口的返回存到 window.__signinResult
+SIGNIN_HOOK_JS = """
+(function(hint){
+    if (window.__signinHookInstalled) { window.__signinResult = null; return; }
+    window.__signinHookInstalled = true;
+    window.__signinResult = null;
+
+    // 拦截 XMLHttpRequest
+    var _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url){
+        try {
+            if (String(url).indexOf(hint) > -1) {
+                this.addEventListener('load', function(){
+                    window.__signinResult = {
+                        via: 'xhr',
+                        status: this.status,
+                        body: String(this.responseText || '').slice(0, 500)
+                    };
+                });
+            }
+        } catch(e) {}
+        return _open.apply(this, arguments);
+    };
+
+    // 拦截 fetch
+    if (window.fetch) {
+        var _fetch = window.fetch;
+        window.fetch = function(input, init){
+            var url = (typeof input === 'string') ? input : (input && input.url) || '';
+            var p = _fetch.apply(this, arguments);
+            if (String(url).indexOf(hint) > -1) {
+                p.then(function(resp){
+                    try {
+                        resp.clone().text().then(function(t){
+                            window.__signinResult = {
+                                via: 'fetch',
+                                status: resp.status,
+                                body: String(t || '').slice(0, 500)
+                            };
+                        });
+                    } catch(e) {}
+                });
+            }
+            return p;
+        };
+    }
+})(arguments[0]);
+"""
+
+
+def install_signin_hook(sb):
+    try:
+        sb.execute_script(SIGNIN_HOOK_JS, SIGNIN_API_HINT)
+        log("INFO", f"已注入签到接口拦截钩子 (hint={SIGNIN_API_HINT})")
+        return True
+    except Exception as e:
+        log("WARN", f"注入拦截钩子失败（降级为刷新检测）: {e}")
+        return False
+
+
+def read_signin_result(sb):
+    try:
+        return sb.execute_script("return window.__signinResult;")
+    except Exception:
+        return None
+
+
+def looks_success(status, body):
+    if status != 200:
+        return False
+    b = (body or "").lower()
+    # 常见成功标志；按站点真实返回可再补充
+    good = ["success", "成功", "已签到", "\"code\":0", "'code':0", "\"code\": 0"]
+    bad = ["fail", "失败", "error", "captcha", "验证"]
+    if any(g.lower() in b for g in good):
+        return True
+    # 200 且无明显错误关键字，也倾向成功
+    if not any(x in b for x in bad):
+        return True
+    return False
+
+
 def do_signin(sb):
     log("INFO", "打开签到页")
     if hasattr(sb, "uc_open_with_reconnect"):
@@ -666,7 +726,7 @@ def do_signin(sb):
     if is_signed(html):
         return True, "今日已签到", before_points, before_points, None
 
-    if not wait_hcaptcha_solved(sb, "signin"):
+    if not wait_hcaptcha_solved(sb, "signin", timeout=120):
         return False, "签到失败", before_points, before_points, "签到 hCaptcha 求解失败"
 
     if not sb.is_element_visible("#points-signin-submit"):
@@ -674,26 +734,78 @@ def do_signin(sb):
         dump_html(sb, "04_signin_no_button")
         return False, "签到失败", before_points, before_points, "找不到签到按钮"
 
-    bx, by = get_element_screen_pos(sb, "#points-signin-submit")
-    if bx:
-        mouse_click(bx, by, "签到按钮")
-    else:
-        sb.click("#points-signin-submit")
-    log("INFO", "已点击签到")
-    time.sleep(3)
+    # ⚠️ 必须在点击之前注入钩子，否则会漏掉这次请求
+    install_signin_hook(sb)
 
-    wait_hcaptcha_solved(sb, "signin_after_click")
+    sb.execute_script("document.querySelector('#points-signin-submit').scrollIntoView({block: 'center'});")
+    time.sleep(1)
 
-    for i in range(10):
+    # 优先 JS 点击（点的是 type=submit，会触发 AJAX POST /points/signin），最稳
+    clicked = False
+    try:
+        clicked = bool(sb.execute_script(
+            "var b=document.querySelector('#points-signin-submit');"
+            "if(b){b.click();return true;}return false;"
+        ))
+    except Exception as e:
+        log("WARN", f"JS 点击失败，改坐标点击: {e}")
+
+    if not clicked:
+        bx, by = get_element_screen_pos(sb, "#points-signin-submit")
+        if bx:
+            mouse_click(bx, by, "签到按钮")
+        else:
+            sb.click("#points-signin-submit")
+    log("INFO", "已点击签到（等待接口返回）")
+
+    # 点击后可能又冒出一次 hCaptcha
+    wait_hcaptcha_solved(sb, "signin_after_click", timeout=90)
+
+    # 轮询读接口返回（不再瞎刷 DOM）
+    result = None
+    for i in range(20):
+        time.sleep(1)
+        result = read_signin_result(sb)
+        if result:
+            break
+        # 兜底：万一钩子没拦到（比如注入失败），刷新页面看状态
+        if i == 12:
+            try:
+                sb.open(SIGNIN_URL)
+                time.sleep(2)
+                if is_signed(sb.get_page_source()):
+                    cur_html = sb.get_page_source()
+                    return True, "签到成功", before_points, extract_points(cur_html), None
+            except Exception:
+                pass
+        log("INFO", f"等待签到接口返回... ({i + 1})")
+
+    if result:
+        status = result.get("status")
+        body = result.get("body", "")
+        log("INFO", f"签到接口返回: via={result.get('via')} status={status} body={body[:200]}")
+        if looks_success(status, body):
+            # 刷新拿最新积分
+            try:
+                sb.open(SIGNIN_URL)
+                time.sleep(2)
+                cur_html = sb.get_page_source()
+            except Exception:
+                cur_html = html
+            return True, "签到成功", before_points, extract_points(cur_html), None
+        return False, "签到失败", before_points, before_points, f"接口返回异常: status={status} body={body[:150]}"
+
+    # 没拿到接口返回，最后再刷新兜底判断一次
+    try:
+        sb.open(SIGNIN_URL)
         time.sleep(2)
-        html = sb.get_page_source()
-        if is_signed(html):
-            current_points = extract_points(html)
-            return True, "签到成功", before_points, current_points, None
-        log("INFO", f"等待签到结果... ({i + 1})")
-
-    current_points = extract_points(sb.get_page_source())
-    return False, "签到失败", before_points, current_points, "未确认签到状态"
+        cur_html = sb.get_page_source()
+        if is_signed(cur_html):
+            return True, "签到成功", before_points, extract_points(cur_html), None
+        current_points = extract_points(cur_html)
+    except Exception:
+        current_points = before_points
+    return False, "签到失败", before_points, current_points, "未捕获到签到接口返回，且刷新后仍非已签到"
 
 
 # ── 主流程 ────────────────────────────────────────────────
@@ -753,10 +865,8 @@ def vps8_checkin():
             sb_kwargs["proxy"] = PROXY
 
         with SB(**sb_kwargs) as sb:
-            # 更新 DISPLAY（xvfb-run 会注入）
             DISPLAY = os.environ.get("DISPLAY", DISPLAY)
 
-            # 调大脚本/页面超时，避免重型 SPA 下 execute_script 触发 script timeout
             try:
                 sb.driver.set_script_timeout(30)
                 sb.driver.set_page_load_timeout(60)
