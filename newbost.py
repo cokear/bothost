@@ -1,31 +1,43 @@
 """
-bot-hosting.net 自动续期 (纯正 OAuth 登录版 - 终极物理爆破弹窗版)
+bot-hosting.net 自动续期 (OAuth + Turnstile xdotool 物理破解版)
+
+依赖:
+  - seleniumbase
+  - xdotool (apt install xdotool)
+  - Xvfb (xvfb=True 已内置)
+  - cf_turnstile_solver.py (同目录)
+
+环境变量:
+  BROWSER_PROXY          代理地址
+  BROWSER_USER_DATA_DIR  Chrome 持久化 Profile 目录
+  TG_BOT_TOKEN           Telegram Bot Token
+  TG_CHAT_ID             Telegram Chat ID
+  CI                     设为 "true" 启用 CI 模式
 """
+
 import time
 import os
-import re
 import json
 import requests
 import traceback
 import sys
 from pathlib import Path
+
 from seleniumbase import SB
+from cf_turnstile_solver import solve as cf_solve, is_solved
 
 # ================= 配置区域 =================
 HERE = Path(__file__).resolve().parent
 
-PROXY_URL       = os.getenv("BROWSER_PROXY", "")
-PROFILE_DIR     = os.getenv("BROWSER_USER_DATA_DIR",
-                            os.path.expanduser("~/.chrome-profile-discord"))
-NOPECHA_EXT_DIR = os.getenv("NOPECHA_EXT_DIR", 
-                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium"))
+PROXY_URL   = os.getenv("BROWSER_PROXY", "")
+PROFILE_DIR = os.getenv("BROWSER_USER_DATA_DIR",
+                        os.path.expanduser("~/.chrome-profile-discord"))
 
-# 面板续期所需的链接
 HOME_URL     = "https://bot-hosting.net/"
 LOGIN_URL    = "https://bot-hosting.net/login"
 BILLINGS_URL = "https://bot-hosting.net/a/billings"
 RENEW_TEXT   = "Renew"
-COOLDOWN_BETWEEN_CLICKS = 3
+COOLDOWN_BETWEEN_CLICKS = 5  # 每台机器续期间隔（秒），防 rate limit
 
 TG_TOKEN   = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
@@ -34,13 +46,16 @@ IS_CI   = os.getenv("CI") == "true"
 DISPLAY = os.environ.get("DISPLAY", ":99")
 # ===========================================
 
+
 def log(level: str, msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
+
 
 # ── Telegram 推送 ─────────────────────────────────────────
 
 def _tg_enabled() -> bool:
     return bool(TG_TOKEN and TG_CHAT_ID)
+
 
 def tg_text(text: str) -> None:
     if not _tg_enabled():
@@ -58,6 +73,7 @@ def tg_text(text: str) -> None:
         )
     except Exception as e:
         log("WARN", f"[TG] sendMessage failed: {e}")
+
 
 def tg_file(path: str | Path, caption: str = "", kind: str = "document") -> None:
     if not _tg_enabled():
@@ -79,7 +95,7 @@ def tg_file(path: str | Path, caption: str = "", kind: str = "document") -> None
         log("WARN", f"[TG] {method} failed: {e}")
 
 
-# ── JS 与外设操作 ─────────────────────────────────────────
+# ── JS 辅助 ───────────────────────────────────────────────
 
 def js_eval(sb, expr: str):
     try:
@@ -88,8 +104,9 @@ def js_eval(sb, expr: str):
         log("WARN", f"js_eval 失败: {e}")
         return None
 
+
 def js_click_by_text(sb, texts, tags=("a", "button"), href_contains=None):
-    """CDP 模式下按可见文本 / href 找元素并 JS 点击，命中返回 True。"""
+    """按可见文本 / href 找元素并 JS 点击，命中返回 True。"""
     payload = {
         "texts": [t.lower() for t in texts],
         "tags": list(tags),
@@ -121,12 +138,33 @@ def js_click_by_text(sb, texts, tags=("a", "button"), href_contains=None):
         return False
 
 
+def wait_for_renew_button_enabled(sb, timeout: float = 15.0) -> bool:
+    """等待弹窗内的 'Renew for' 按钮从 disabled 变为 enabled。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        enabled = js_eval(sb, """
+            (function() {
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    if (btns[i].textContent.indexOf('Renew for') !== -1) {
+                        return !btns[i].disabled;
+                    }
+                }
+                return false;
+            })()
+        """)
+        if enabled:
+            return True
+    return False
+
+
 # ── bot-hosting 续期主逻辑 ──────────────────────────────
 
 def do_renew(proxy: str | None) -> tuple[bool, int]:
     if not PROFILE_DIR:
         log("WARN", "未配置 BROWSER_USER_DATA_DIR，未加载持久化 Profile！")
-    
+
     sb_kwargs = dict(
         uc=True,
         test=False,
@@ -138,20 +176,18 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
     )
     if proxy:
         sb_kwargs["proxy"] = proxy.replace("http://", "").replace("https://", "")
-        log("INFO", f"SeleniumBase 使用代理：{sb_kwargs['proxy']}")
+        log("INFO", f"SeleniumBase 使用代理: {sb_kwargs['proxy']}")
     else:
         log("INFO", "SeleniumBase 直连运行")
 
     with SB(**sb_kwargs) as sb:
         sb.driver.set_page_load_timeout(60)
 
-        # ---------------- OAuth 登录 ----------------
-        log("INFO", "\n=== [Step 1] 打开登录页，尝试使用 Discord 一键登录 ===")
-        log("INFO", "直接跳转 Discord OAuth 入口 /login/discord ...")
+        # ──────────── Step 1: OAuth 登录 ────────────
+        log("INFO", "\n=== [Step 1] Discord OAuth 登录 ===")
         sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", 4)
         sb.sleep(4)
-        
-        cur_url = sb.get_current_url()
+
         oauth_success = False
         authorized_seen = False
         for _ in range(20):
@@ -159,12 +195,12 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
             try:
                 u = sb.get_current_url()
             except Exception as e:
-                log("WARN", f"get_current_url 抖动（重连窗口期），重试: {e}")
+                log("WARN", f"get_current_url 抖动: {e}")
                 continue
 
             if "discord.com/oauth2/authorize" in u:
                 authorized_seen = True
-                log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行终极滑动逻辑...")
+                log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行滑动...")
                 sb.execute_script("""
                     const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
                         '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
@@ -187,124 +223,160 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                     scrollTo(0, document.body.scrollHeight);
                 """)
                 sb.sleep(1.5)
-                
                 if js_click_by_text(sb, texts=["authorize", "授权"], tags=("button",)):
-                    log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
+                    log("INFO", "[OAuth] ✓ 点击 Discord 授权按钮")
                 sb.sleep(3)
             elif "bot-hosting.net" in u and ("login" not in u or authorized_seen):
-                log("INFO", f"✓ 成功进入或返回面板 (URL: {u})")
+                log("INFO", f"✓ 进入面板 ({u})")
                 oauth_success = True
                 break
-        
-        if not oauth_success:
-            (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
-            sb.save_screenshot(str(HERE / "page_debug.png"))
-            raise RuntimeError("OAuth 流程超时，未能成功跳回面板")
 
-        # ---------------- 跳转 Billings ----------------
+        if not oauth_success:
+            (HERE / "debug_step1.html").write_text(sb.get_page_source(), encoding="utf-8")
+            sb.save_screenshot(str(HERE / "debug_step1.png"))
+            raise RuntimeError("OAuth 流程超时，未能跳回面板")
+
+        # ──────────── Step 2: 跳转 Billings ────────────
         log("INFO", f"\n=== [Step 2] 跳转 {BILLINGS_URL} ===")
         sb.uc_open_with_reconnect(BILLINGS_URL, 4)
         sb.sleep(5)
-        
+
         cur_url = sb.get_current_url()
         log("INFO", f"页面标题: {sb.get_title()}")
         log("INFO", f"当前 URL: {cur_url}")
 
         if "billings" not in cur_url.lower():
-            log("ERROR", "未停留在 /a/billings，授权登录可能失败。")
-            (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
-            sb.save_screenshot(str(HERE / "page_debug.png"))
+            (HERE / "debug_step2.html").write_text(sb.get_page_source(), encoding="utf-8")
+            sb.save_screenshot(str(HERE / "debug_step2.png"))
             raise RuntimeError("OAuth 登录后未能进入 billings 页面")
-            
+
         log("INFO", "✓ 成功进入续期页面！")
 
-        # ---------------- 找 Renew 按钮 ----------------
-        log("INFO", f"\n=== [Step 3] 查找外层 '{RENEW_TEXT}' 按钮 ===")
-        renew_css = f'button:contains("{RENEW_TEXT}"), a:contains("{RENEW_TEXT}")'
+        # ──────────── Step 3: 找 Renew 按钮 ────────────
+        log("INFO", f"\n=== [Step 3] 查找 '{RENEW_TEXT}' 按钮 ===")
+
+        # 用 XPath 替代 CSS :contains（:contains 不是标准 CSS）
+        renew_xpath = (
+            f'//button[contains(text(),"{RENEW_TEXT}")]'
+            f' | //a[contains(text(),"{RENEW_TEXT}")]'
+            f' | //button[.//span[contains(text(),"{RENEW_TEXT}")]]'
+            f' | //a[.//span[contains(text(),"{RENEW_TEXT}")]]'
+        )
+
         try:
-            sb.wait_for_element_visible(renew_css, timeout=15)
+            sb.wait_for_element_visible(renew_xpath, timeout=15)
         except Exception:
-            log("INFO", f"✓ 15 秒内没找到 '{RENEW_TEXT}' 按钮，说明机器都已经续期满了")
-            (HERE / "page_debug.html").write_text(sb.get_page_source(), encoding="utf-8")
-            sb.save_screenshot(str(HERE / "page_debug.png"))
+            log("INFO", f"✓ 未找到 '{RENEW_TEXT}' 按钮，所有机器已续期")
+            (HERE / "debug_step3.html").write_text(sb.get_page_source(), encoding="utf-8")
+            sb.save_screenshot(str(HERE / "debug_step3.png"))
             return False, 0
 
-        buttons = sb.find_elements(renew_css)
-        total_buttons = len(buttons)
-        log("INFO", f"✓ 找到 {total_buttons} 个按钮，准备进入弹窗打卡环节")
+        buttons = sb.find_elements(renew_xpath)
+        total = len(buttons)
+        log("INFO", f"✓ 找到 {total} 个 Renew 按钮")
 
-        # ---------------- 逐个强制 JS 点击 ----------------
-        log("INFO", "\n=== [Step 4] 逐个点击外层按钮 -> 过弹窗验证 -> 确认续期 ===")
+        # ──────────── Step 4: 逐个续期 ────────────
+        log("INFO", "\n=== [Step 4] 逐个续期 (Turnstile 物理破解) ===")
         clicked = 0
-        for i in range(total_buttons):
+
+        for i in range(total):
             try:
-                current_buttons = sb.find_elements(renew_css)
+                # 每次循环重新查找，避免 stale element
+                current_buttons = sb.find_elements(renew_xpath)
                 if i >= len(current_buttons):
                     break
-                
+
                 btn = current_buttons[i]
                 text = (btn.text or "").strip()
-                
-                log("INFO", f"[{i+1}/{total_buttons}] '{text}' 准备点击开启弹窗！")
-                sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                log("INFO", f"\n[{i+1}/{total}] '{text}'")
+
+                # 4a. 滚动到按钮并点击，触发弹窗
+                sb.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 sb.sleep(1)
-                
-                # 1. 触发弹窗
                 sb.execute_script("arguments[0].click();", btn)
-                log("INFO", "  ✓ 外层按钮已点击，等待弹窗加载...")
-                sb.sleep(3) 
+                log("INFO", "  ✓ 已点击外层按钮，等待弹窗...")
+                sb.sleep(3)
 
-                # 2. 物理点击被 Shadow DOM 隔离的 Turnstile 容器
-                log("INFO", "  🛡️ 定位 Shadow DOM 外部容器，准备进行 CDP 物理点击...")
-                
-                turnstile_host_xpath = '//input[@name="cf-turnstile-response"]/..'
-                try:
-                    sb.wait_for_element_present(turnstile_host_xpath, timeout=10)
-                    sb.uc_click(turnstile_host_xpath)
-                    log("INFO", "  ✅ 验证码容器已被精准物理点击，等待 5 秒解锁...")
-                except Exception as e:
-                    log("WARN", f"  找不到验证码容器: {e}")
-                
-                sb.sleep(5) 
+                # 4b. 用 cf_turnstile_solver 破解 Turnstile
+                log("INFO", "  🛡️ 启动 Turnstile xdotool 物理破解...")
+                result = cf_solve(
+                    sb,
+                    rounds=3,
+                    post_click_wait=30,
+                    on_log=lambda m: log("INFO", f"    {m}"),
+                    debug=True,
+                )
 
-                # 3. 点击弹窗内的最终确认按钮
-                inner_btn_css = 'button:contains("Renew for")'
+                if result.solved:
+                    log("INFO", f"  ✅ Turnstile 已通过 (耗时 {result.elapsed:.1f}s)")
+                else:
+                    log("WARN", f"  ❌ Turnstile 未通过: {result.status} - {result.note}")
+                    sb.save_screenshot(str(HERE / f"turnstile_fail_{i+1}.png"))
+                    # 即使 solver 报告失败，也检查一下按钮是否已经 enabled
+                    # 有时 xdotool 点击实际生效了但 token 读取方式不匹配
+                    if not wait_for_renew_button_enabled(sb, timeout=5):
+                        log("WARN", f"  ✗ 确认按钮仍为 disabled，跳过")
+                        continue
+                    log("INFO", "  ⚡ 确认按钮已启用，继续！")
+
+                # 4c. 等按钮启用 + 点击内层确认
+                sb.sleep(1)
+                inner_css = 'button:has-text("Renew for")'
                 try:
-                    sb.wait_for_element_visible(inner_btn_css, timeout=5)
-                    inner_btn = sb.find_element(inner_btn_css)
+                    sb.wait_for_element_visible(inner_css, timeout=8)
+                    inner_btn = sb.find_element(inner_css)
+
+                    # 二次确认：检查 disabled 状态
+                    is_disabled = js_eval(sb, """
+                        (function() {
+                            var btns = document.querySelectorAll('button');
+                            for (var i = 0; i < btns.length; i++) {
+                                if (btns[i].textContent.indexOf('Renew for') !== -1)
+                                    return btns[i].disabled;
+                            }
+                            return true;
+                        })()
+                    """)
+                    if is_disabled:
+                        log("WARN", "  ⚠️ 按钮仍 disabled，额外等待...")
+                        wait_for_renew_button_enabled(sb, timeout=10)
+
                     sb.execute_script("arguments[0].click();", inner_btn)
-                    log("INFO", "  ✓ 成功强点内层续期确认按钮！")
+                    log("INFO", "  ✓ 点击确认续期！")
                     clicked += 1
-                except Exception:
-                    log("ERROR", "  ✗ 弹窗内的最终确认按钮未找到")
+                except Exception as e:
+                    log("ERROR", f"  ✗ 内层确认按钮未找到: {e}")
 
                 sb.sleep(COOLDOWN_BETWEEN_CLICKS)
 
-                # 兼容旧版确认弹窗
+                # 兼容旧版 Swal 确认弹窗
                 try:
                     if sb.is_element_visible("button.swal-button--confirm"):
                         sb.click("button.swal-button--confirm")
-                        log("INFO", "  ✓ 点掉旧版确认弹窗")
+                        log("INFO", "  ✓ 关闭旧版确认弹窗")
                         sb.sleep(2)
                 except Exception:
                     pass
 
             except Exception as e:
-                log("ERROR", f"  ✗ 第 {i+1} 个机器处理失败: {type(e).__name__}: {e}")
+                log("ERROR", f"  ✗ 第 {i+1} 台处理失败: {type(e).__name__}: {e}")
+                sb.save_screenshot(str(HERE / f"error_{i+1}.png"))
 
         sb.save_screenshot(str(HERE / "after_renew.png"))
         log("INFO", f"\n✅ 共成功处理了 {clicked} 台机器的续期")
         return clicked > 0, clicked
 
-# ============ 入口 ============
+
+# ── 入口 ──────────────────────────────────────────────────
 
 def main():
     proxy = PROXY_URL if PROXY_URL else None
 
     tg_text(
         f"🚀 <b>bot-hosting renew</b>\n开始运行\n"
-        f"代理：{'✓ ' + proxy if proxy else '✗ 直连'}\n"
-        f"登录：自动 OAuth (Discord)"
+        f"代理: {'✓ ' + proxy if proxy else '✗ 直连'}\n"
+        f"登录: OAuth (Discord)\n"
+        f"验证码: xdotool 物理破解"
     )
 
     try:
@@ -313,22 +385,19 @@ def main():
         tb = traceback.format_exc()
         log("ERROR", tb)
         tg_text(f"❌ <b>bot-hosting renew</b>\n<pre>{str(e)[:1000]}</pre>")
-        tg_file(HERE / "page_debug.png", "page_debug", "photo")
-        tg_file(HERE / "page_debug.html", "page_debug.html", "document")
+        tg_file(HERE / "debug_step1.png", "debug_step1", "photo")
+        tg_file(HERE / "debug_step1.html", "debug_step1.html", "document")
         sys.exit(1)
 
     if success:
-        tg_text(
-            f"✅ <b>bot-hosting renew</b>\n成功，处理了 {clicked} 个机器"
-        )
+        tg_text(f"✅ <b>bot-hosting renew</b>\n成功续期 {clicked} 台机器")
         tg_file(HERE / "after_renew.png", f"after_renew ({clicked} clicks)", "photo")
-        sys.exit(0)
     else:
-        tg_text(
-            f"🎉 <b>bot-hosting renew</b>\n没找到可点的 Renew，大概率都已经续满啦！"
-        )
-        tg_file(HERE / "page_debug.png", "page_debug", "photo")
-        sys.exit(0)
+        tg_text("🎉 <b>bot-hosting renew</b>\n没有需要续期的，全部已满！")
+        tg_file(HERE / "debug_step3.png", "debug_step3", "photo")
+
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
