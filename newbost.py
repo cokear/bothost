@@ -147,15 +147,13 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
 
         # ---------------- OAuth 登录 ----------------
         log("INFO", "\n=== [Step 1] 打开登录页，尝试使用 Discord 一键登录 ===")
-        # 登录页有固定链接 <a href="/login/discord">Continue with Discord</a>，
-        # 直接开这个 URL 等价于点它，最稳。
         log("INFO", "直接跳转 Discord OAuth 入口 /login/discord ...")
         sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", 4)
         sb.sleep(4)
         
         cur_url = sb.get_current_url()
         oauth_success = False
-        authorized_seen = False   # 是否已经进过 Discord 授权页
+        authorized_seen = False
         for _ in range(20):
             sb.sleep(2)
             try:
@@ -167,7 +165,6 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
             if "discord.com/oauth2/authorize" in u:
                 authorized_seen = True
                 log("INFO", "[OAuth] 拦截到 Discord 授权确认页，执行终极滑动逻辑...")
-                # 1. 终极滑动（照搬参考脚本的最强滑动黑科技）
                 sb.execute_script("""
                     const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
                         '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
@@ -191,10 +188,9 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                 """)
                 sb.sleep(1.5)
                 
-                # 2. 寻找并点击授权按钮（CDP 安全版：JS 文本匹配）
                 if js_click_by_text(sb, texts=["authorize", "授权"], tags=("button",)):
                     log("INFO", "[OAuth] ✓ 成功点击 Discord 授权按钮！")
-                sb.sleep(3)   # 给重定向留时间
+                sb.sleep(3)
             elif "bot-hosting.net" in u and ("login" not in u or authorized_seen):
                 log("INFO", f"✓ 成功进入或返回面板 (URL: {u})")
                 oauth_success = True
@@ -223,7 +219,7 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
         log("INFO", "✓ 成功进入续期页面！")
 
         # ---------------- 找 Renew 按钮 ----------------
-        log("INFO", f"\n=== [Step 3] 查找 '{RENEW_TEXT}' 按钮 ===")
+        log("INFO", f"\n=== [Step 3] 查找外层 '{RENEW_TEXT}' 按钮 ===")
         renew_css = f'button:contains("{RENEW_TEXT}"), a:contains("{RENEW_TEXT}")'
         try:
             sb.wait_for_element_visible(renew_css, timeout=15)
@@ -233,25 +229,16 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
             sb.save_screenshot(str(HERE / "page_debug.png"))
             return False, 0
 
-        # 用 UC 模式原生方法点 Cloudflare Turnstile 复选框
-        log("INFO", "🛡️ 尝试用 UC 模式点击 Cloudflare Turnstile 验证框...")
-        try:
-            sb.uc_gui_click_captcha()
-            log("INFO", "✅ Turnstile 验证已点击，等待解锁...")
-        except Exception as e:
-            log("WARN", f"uc_gui_click_captcha 未触发（可能不需要验证）: {e}")
-        sb.sleep(5)  # 等待验证结果生效
-
+        # 获取所有可见的外层按钮
         buttons = sb.find_elements(renew_css)
         total_buttons = len(buttons)
-        log("INFO", f"✓ 找到 {total_buttons} 个按钮，准备点击")
+        log("INFO", f"✓ 找到 {total_buttons} 个按钮，准备进入弹窗打卡环节")
 
         # ---------------- 逐个强制 JS 点击 ----------------
-        log("INFO", "\n=== [Step 4] 逐个点击 Renew 按钮 ===")
+        log("INFO", "\n=== [Step 4] 逐个点击外层按钮 -> 过弹窗验证 -> 确认续期 ===")
         clicked = 0
         for i in range(total_buttons):
             try:
-                # 重新抓取元素，防止 StaleElement 报错
                 current_buttons = sb.find_elements(renew_css)
                 if i >= len(current_buttons):
                     break
@@ -259,29 +246,51 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                 btn = current_buttons[i]
                 text = (btn.text or "").strip()
                 
-                log("INFO", f"[{i+1}/{total_buttons}] '{text}' 准备强行点击！")
-                
+                log("INFO", f"[{i+1}/{total_buttons}] '{text}' 准备点击开启弹窗！")
                 sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                 sb.sleep(1)
-                # 使用原生 JS Click，无视 Selenium 所谓的是否可聚焦、是否被遮挡
+                
+                # 1. 触发弹窗
                 sb.execute_script("arguments[0].click();", btn)
-                clicked += 1
+                log("INFO", "  ✓ 外层按钮已点击，等待弹窗加载...")
+                sb.sleep(3) 
+
+                # 2. 点击弹窗内的 Turnstile
+                log("INFO", "  🛡️ 尝试用 UC 模式点击弹窗内的 Turnstile 验证框...")
+                try:
+                    sb.uc_gui_click_captcha()
+                    log("INFO", "  ✅ Turnstile 验证已点击，等待 5 秒解锁...")
+                except Exception as e:
+                    log("WARN", f"  uc_gui_click_captcha 未触发: {e}")
+                sb.sleep(5)
+
+                # 3. 点击弹窗内的最终确认按钮 (带有 Renew for 字样)
+                inner_btn_css = 'button:contains("Renew for")'
+                try:
+                    sb.wait_for_element_visible(inner_btn_css, timeout=5)
+                    inner_btn = sb.find_element(inner_btn_css)
+                    sb.execute_script("arguments[0].click();", inner_btn)
+                    log("INFO", "  ✓ 成功点击内层续期确认按钮！")
+                    clicked += 1
+                except Exception:
+                    log("ERROR", "  ✗ 弹窗内的最终确认按钮未找到或无法点击")
+
                 sb.sleep(COOLDOWN_BETWEEN_CLICKS)
 
-                # 处理弹窗
+                # 兼容旧版确认弹窗（如果有遗留的话）
                 try:
-                    sb.wait_for_element_visible("button.swal-button--confirm", timeout=3)
-                    sb.click("button.swal-button--confirm")
-                    log("INFO", "  ✓ 点掉确认弹窗")
-                    sb.sleep(2)
+                    if sb.is_element_visible("button.swal-button--confirm"):
+                        sb.click("button.swal-button--confirm")
+                        log("INFO", "  ✓ 点掉旧版确认弹窗")
+                        sb.sleep(2)
                 except Exception:
                     pass
 
             except Exception as e:
-                log("ERROR", f"  ✗ 第 {i+1} 个按钮点击失败: {type(e).__name__}: {e}")
+                log("ERROR", f"  ✗ 第 {i+1} 个机器处理失败: {type(e).__name__}: {e}")
 
         sb.save_screenshot(str(HERE / "after_renew.png"))
-        log("INFO", f"\n✅ 共点击 {clicked} 个 Renew 按钮")
+        log("INFO", f"\n✅ 共成功处理了 {clicked} 台机器的续期")
         return clicked > 0, clicked
 
 # ============ 入口 ============
@@ -307,7 +316,7 @@ def main():
 
     if success:
         tg_text(
-            f"✅ <b>bot-hosting renew</b>\n成功，点击了 {clicked} 个机器"
+            f"✅ <b>bot-hosting renew</b>\n成功，处理了 {clicked} 个机器"
         )
         tg_file(HERE / "after_renew.png", f"after_renew ({clicked} clicks)", "photo")
         sys.exit(0)
