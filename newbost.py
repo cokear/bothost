@@ -1,5 +1,5 @@
 """
-bot-hosting.net 自动续期 (纯正 OAuth 登录版 - 弹窗终极修复版)
+bot-hosting.net 自动续期 (纯正 OAuth 登录版 - 终极物理爆破弹窗版)
 """
 import time
 import os
@@ -229,7 +229,6 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
             sb.save_screenshot(str(HERE / "page_debug.png"))
             return False, 0
 
-        # 获取所有可见的外层按钮
         buttons = sb.find_elements(renew_css)
         total_buttons = len(buttons)
         log("INFO", f"✓ 找到 {total_buttons} 个按钮，准备进入弹窗打卡环节")
@@ -255,20 +254,20 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                 log("INFO", "  ✓ 外层按钮已点击，等待弹窗加载...")
                 sb.sleep(3) 
 
-                # 2. 精准定位并物理点击弹窗内的 Turnstile iframe (彻底抛弃点空气的 gui 方法)
-                log("INFO", "  🛡️ 定位 Cloudflare iframe 进行元素级物理点击...")
-                cf_iframe = 'iframe[src*="cloudflare"]'
-                try:
-                    sb.wait_for_element_visible(cf_iframe, timeout=5)
-                    # uc_click 会绕过反爬，直接对这个具体的 iframe 元素开枪
-                    sb.uc_click(cf_iframe)
-                    log("INFO", "  ✅ 验证码已物理点击，等待 5 秒解锁...")
-                except Exception as e:
-                    log("WARN", f"  找不到或无法点击验证码: {e}")
+                # 2. 物理点击被 Shadow DOM 隔离的 Turnstile 容器
+                log("INFO", "  🛡️ 定位 Shadow DOM 外部容器，准备进行 CDP 物理点击...")
                 
-                sb.sleep(5) # 给它足够的时间转圈圈打绿勾
+                turnstile_host_xpath = '//input[@name="cf-turnstile-response"]/..'
+                try:
+                    sb.wait_for_element_present(turnstile_host_xpath, timeout=10)
+                    sb.uc_click(turnstile_host_xpath)
+                    log("INFO", "  ✅ 验证码容器已被精准物理点击，等待 5 秒解锁...")
+                except Exception as e:
+                    log("WARN", f"  找不到验证码容器: {e}")
+                
+                sb.sleep(5) 
 
-                # 3. 点击弹窗内的最终确认按钮 (带有 Renew for 字样)
+                # 3. 点击弹窗内的最终确认按钮
                 inner_btn_css = 'button:contains("Renew for")'
                 try:
                     sb.wait_for_element_visible(inner_btn_css, timeout=5)
@@ -281,7 +280,7 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
 
                 sb.sleep(COOLDOWN_BETWEEN_CLICKS)
 
-                # 兼容旧版确认弹窗（如果有遗留的话）
+                # 兼容旧版确认弹窗
                 try:
                     if sb.is_element_visible("button.swal-button--confirm"):
                         sb.click("button.swal-button--confirm")
