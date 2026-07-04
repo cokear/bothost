@@ -1,5 +1,5 @@
 """
-bot-hosting.net 自动续期 (纯正 OAuth 登录版)
+bot-hosting.net 自动续期 (纯正 OAuth 登录版 - 弹窗终极修复版)
 """
 import time
 import os
@@ -255,14 +255,18 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                 log("INFO", "  ✓ 外层按钮已点击，等待弹窗加载...")
                 sb.sleep(3) 
 
-                # 2. 点击弹窗内的 Turnstile
-                log("INFO", "  🛡️ 尝试用 UC 模式点击弹窗内的 Turnstile 验证框...")
+                # 2. 精准定位并物理点击弹窗内的 Turnstile iframe (彻底抛弃点空气的 gui 方法)
+                log("INFO", "  🛡️ 定位 Cloudflare iframe 进行元素级物理点击...")
+                cf_iframe = 'iframe[src*="cloudflare"]'
                 try:
-                    sb.uc_gui_click_captcha()
-                    log("INFO", "  ✅ Turnstile 验证已点击，等待 5 秒解锁...")
+                    sb.wait_for_element_visible(cf_iframe, timeout=5)
+                    # uc_click 会绕过反爬，直接对这个具体的 iframe 元素开枪
+                    sb.uc_click(cf_iframe)
+                    log("INFO", "  ✅ 验证码已物理点击，等待 5 秒解锁...")
                 except Exception as e:
-                    log("WARN", f"  uc_gui_click_captcha 未触发: {e}")
-                sb.sleep(5)
+                    log("WARN", f"  找不到或无法点击验证码: {e}")
+                
+                sb.sleep(5) # 给它足够的时间转圈圈打绿勾
 
                 # 3. 点击弹窗内的最终确认按钮 (带有 Renew for 字样)
                 inner_btn_css = 'button:contains("Renew for")'
@@ -270,10 +274,10 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                     sb.wait_for_element_visible(inner_btn_css, timeout=5)
                     inner_btn = sb.find_element(inner_btn_css)
                     sb.execute_script("arguments[0].click();", inner_btn)
-                    log("INFO", "  ✓ 成功点击内层续期确认按钮！")
+                    log("INFO", "  ✓ 成功强点内层续期确认按钮！")
                     clicked += 1
                 except Exception:
-                    log("ERROR", "  ✗ 弹窗内的最终确认按钮未找到或无法点击")
+                    log("ERROR", "  ✗ 弹窗内的最终确认按钮未找到")
 
                 sb.sleep(COOLDOWN_BETWEEN_CLICKS)
 
