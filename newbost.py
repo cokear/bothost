@@ -37,7 +37,7 @@ HOME_URL     = "https://bot-hosting.net/"
 LOGIN_URL    = "https://bot-hosting.net/login"
 BILLINGS_URL = "https://bot-hosting.net/a/billings"
 RENEW_TEXT   = "Renew"
-COOLDOWN_BETWEEN_CLICKS = 5  # 每台机器续期间隔（秒），防 rate limit
+COOLDOWN_BETWEEN_CLICKS = 5
 
 TG_TOKEN   = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
@@ -145,9 +145,10 @@ def wait_for_renew_button_enabled(sb, timeout: float = 15.0) -> bool:
         time.sleep(0.5)
         enabled = js_eval(sb, """
             (function() {
-                var btns = document.querySelectorAll('button');
+                var btns = document.querySelectorAll('button, a, div[role="button"], span[role="button"]');
                 for (var i = 0; i < btns.length; i++) {
-                    if (btns[i].textContent.indexOf('Renew for') !== -1) {
+                    var t = btns[i].textContent || '';
+                    if (t.indexOf('Renew for') !== -1) {
                         return !btns[i].disabled;
                     }
                 }
@@ -157,6 +158,108 @@ def wait_for_renew_button_enabled(sb, timeout: float = 15.0) -> bool:
         if enabled:
             return True
     return False
+
+
+def click_renew_confirm(sb, label: str = "renew 内层按钮") -> bool:
+    """多策略点击弹窗内的确认续期按钮，返回是否成功。"""
+    # 策略 1: JS 遍历所有按钮，按文本匹配点击
+    clicked = js_click_by_text(sb, texts=["Renew for", "Renew free"], tags=("button", "a", "div"))
+    if clicked:
+        log("INFO", f"  ✓ JS 点击 {label} 成功")
+        return True
+
+    # 策略 2: XPath 宽泛匹配
+    for xpath in [
+        '//button[contains(.,"Renew for")]',
+        '//a[contains(.,"Renew for")]',
+        '//button[contains(.,"Renew")]',
+        '//a[contains(.,"Renew")]',
+        '//*[contains(@class,"btn") or contains(@class,"button")]//span[contains(.,"Renew")]/..',
+    ]:
+        try:
+            el = sb.find_element(xpath)
+            sb.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            sb.sleep(0.3)
+            sb.execute_script("arguments[0].click();", el)
+            log("INFO", f"  ✓ XPath 点击 {label} 成功 (xpath={xpath})")
+            return True
+        except Exception:
+            continue
+
+    # 策略 3: 遍历所有可见元素，找含 Renew 文本的可点击元素
+    found = js_eval(sb, """
+        (function() {
+            var all = document.querySelectorAll('*');
+            for (var i = all.length - 1; i >= 0; i--) {
+                var e = all[i];
+                var r = e.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                var t = (e.textContent || '').trim();
+                if (t.indexOf('Renew for') !== -1 && t.length < 50) {
+                    e.scrollIntoView({block:'center'});
+                    e.click();
+                    return true;
+                }
+            }
+            return false;
+        })()
+    """)
+    if found:
+        log("INFO", f"  ✓ 兜底遍历点击 {label} 成功")
+        return True
+
+    return False
+
+
+def diagnose_after_turnstile(sb, step: int) -> dict:
+    """Turnstile 之后的诊断：token 状态 + 按钮状态。"""
+    diag = js_eval(sb, """
+        (function() {
+            var input = document.querySelector(
+                'input[name="cf-turnstile-response"], input[name="cf_turnstile_response"]'
+            );
+            var btns = document.querySelectorAll('button, a, div[role="button"]');
+            var renewBtn = null;
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].textContent || '').trim();
+                if (t.indexOf('Renew for') !== -1) {
+                    renewBtn = btns[i];
+                    break;
+                }
+            }
+            // 查找所有 modal / dialog
+            var modals = document.querySelectorAll(
+                '[class*="modal"], [class*="dialog"], [role="dialog"]'
+            );
+            var modalInfo = [];
+            modals.forEach(function(m) {
+                modalInfo.push({
+                    tag: m.tagName,
+                    classes: m.className.substring(0, 100),
+                    visible: m.getBoundingClientRect().height > 0,
+                    childBtnCount: m.querySelectorAll('button').length,
+                    innerHTML: m.innerHTML.substring(0, 200),
+                });
+            });
+            return {
+                tokenLength: input ? input.value.length : 0,
+                tokenPrefix: input ? input.value.substring(0, 30) : '(no input)',
+                buttonFound: !!renewBtn,
+                buttonDisabled: renewBtn ? renewBtn.disabled : null,
+                buttonTag: renewBtn ? renewBtn.tagName : null,
+                buttonClasses: renewBtn ? renewBtn.className.substring(0, 100) : null,
+                buttonText: renewBtn ? renewBtn.textContent.trim().substring(0, 50) : null,
+                buttonOffsetTop: renewBtn ? renewBtn.getBoundingClientRect().top : null,
+                modalCount: modals.length,
+                modals: modalInfo,
+            };
+        })()
+    """) or {}
+    log("INFO", f"  🔍 [Step {step} 诊断] token={diag.get('tokenLength', '?')} chars, "
+        f"btn={diag.get('buttonFound')}, disabled={diag.get('buttonDisabled')}, "
+        f"tag={diag.get('buttonTag')}, classes={diag.get('buttonClasses')}, "
+        f"modals={diag.get('modalCount')}")
+    return diag
 
 
 # ── bot-hosting 续期主逻辑 ──────────────────────────────
@@ -255,7 +358,6 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
         # ──────────── Step 3: 找 Renew 按钮 ────────────
         log("INFO", f"\n=== [Step 3] 查找 '{RENEW_TEXT}' 按钮 ===")
 
-        # 用 XPath 替代 CSS :contains（:contains 不是标准 CSS）
         renew_xpath = (
             f'//button[contains(text(),"{RENEW_TEXT}")]'
             f' | //a[contains(text(),"{RENEW_TEXT}")]'
@@ -281,7 +383,6 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
 
         for i in range(total):
             try:
-                # 每次循环重新查找，避免 stale element
                 current_buttons = sb.find_elements(renew_xpath)
                 if i >= len(current_buttons):
                     break
@@ -290,14 +391,14 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                 text = (btn.text or "").strip()
                 log("INFO", f"\n[{i+1}/{total}] '{text}'")
 
-                # 4a. 滚动到按钮并点击，触发弹窗
+                # 4a. 点击外层按钮，触发弹窗
                 sb.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 sb.sleep(1)
                 sb.execute_script("arguments[0].click();", btn)
                 log("INFO", "  ✓ 已点击外层按钮，等待弹窗...")
                 sb.sleep(3)
 
-                # 4b. 用 cf_turnstile_solver 破解 Turnstile
+                # 4b. cf_turnstile_solver 物理破解 Turnstile
                 log("INFO", "  🛡️ 启动 Turnstile xdotool 物理破解...")
                 result = cf_solve(
                     sb,
@@ -308,44 +409,30 @@ def do_renew(proxy: str | None) -> tuple[bool, int]:
                 )
 
                 if result.solved:
-                    log("INFO", f"  ✅ Turnstile 已通过 (耗时 {result.elapsed:.1f}s)")
+                    log("INFO", f"  ✅ Turnstile solver 报告通过 (耗时 {result.elapsed:.1f}s)")
                 else:
                     log("WARN", f"  ❌ Turnstile 未通过: {result.status} - {result.note}")
                     sb.save_screenshot(str(HERE / f"turnstile_fail_{i+1}.png"))
-                    # 即使 solver 报告失败，也检查一下按钮是否已经 enabled
-                    # 有时 xdotool 点击实际生效了但 token 读取方式不匹配
-                    if not wait_for_renew_button_enabled(sb, timeout=5):
-                        log("WARN", f"  ✗ 确认按钮仍为 disabled，跳过")
-                        continue
-                    log("INFO", "  ⚡ 确认按钮已启用，继续！")
 
-                # 4c. 等按钮启用 + 点击内层确认
-                sb.sleep(1)
-                inner_css = 'button:has-text("Renew for")'
-                try:
-                    sb.wait_for_element_visible(inner_css, timeout=8)
-                    inner_btn = sb.find_element(inner_css)
+                # 4c. 诊断：检查 token 和按钮实际状态
+                sb.sleep(2)
+                diag = diagnose_after_turnstile(sb, i + 1)
+                sb.save_screenshot(str(HERE / f"diag_{i+1}.png"))
 
-                    # 二次确认：检查 disabled 状态
-                    is_disabled = js_eval(sb, """
-                        (function() {
-                            var btns = document.querySelectorAll('button');
-                            for (var i = 0; i < btns.length; i++) {
-                                if (btns[i].textContent.indexOf('Renew for') !== -1)
-                                    return btns[i].disabled;
-                            }
-                            return true;
-                        })()
-                    """)
-                    if is_disabled:
-                        log("WARN", "  ⚠️ 按钮仍 disabled，额外等待...")
-                        wait_for_renew_button_enabled(sb, timeout=10)
+                # 如果按钮 disabled 但 solver 报告通过，等一下让前端更新
+                if diag.get("buttonDisabled"):
+                    log("INFO", "  ⏳ 按钮仍 disabled，等待前端状态更新...")
+                    wait_for_renew_button_enabled(sb, timeout=15)
+                    # 重新诊断
+                    diag = diagnose_after_turnstile(sb, i + 1)
 
-                    sb.execute_script("arguments[0].click();", inner_btn)
-                    log("INFO", "  ✓ 点击确认续期！")
+                # 4d. 点击内层确认按钮
+                if click_renew_confirm(sb, label=f"[{i+1}/{total}]"):
                     clicked += 1
-                except Exception as e:
-                    log("ERROR", f"  ✗ 内层确认按钮未找到: {e}")
+                    log("INFO", "  ✓ 续期确认已提交！")
+                else:
+                    log("ERROR", "  ✗ 所有策略均无法点击确认按钮")
+                    sb.save_screenshot(str(HERE / f"click_fail_{i+1}.png"))
 
                 sb.sleep(COOLDOWN_BETWEEN_CLICKS)
 
