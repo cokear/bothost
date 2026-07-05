@@ -87,7 +87,7 @@ def mask_ip(ip):
     parts = value.split(".")  # IPv4
     if len(parts) == 4:
         return f"{parts[0]}.{parts[1]}.*.*"
-    return "***"  # 非法格式，直接全脱敏
+    return value[:-2] + "**" if len(value) >= 2 else "**"
 
 
 def mask_proxy(proxy):
@@ -225,6 +225,7 @@ def keyboard_type(text):
             ["xdotool", "type", "--clearmodifiers", "--delay", "80", "--", ch],
             env=env, capture_output=True,
         )
+        time.sleep(random.uniform(0.05, 0.15))
 
 
 def keyboard_key(key):
@@ -400,17 +401,12 @@ def ensure_cdk(sb):
     log("INFO", f"  (DM 文本长度: {len(page_text or '')})")
     cdk, is_recent = extract_latest_cdk(page_text) if page_text else ("", False)
 
-    # 有旧 key：不管时间标记是否可解析，先尝试直接注入复用，避免频繁发命令被限流
     if cdk and is_recent:
         log("INFO", f"✅ 已有24h内的 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
         inject_nopecha_key(sb, cdk)
         return cdk
-    if cdk and not is_recent:
-        log("INFO", f"⚠️ 时间标记判不出/超24h，先尝试复用旧 CDK: {cdk[:4]}****{cdk[-4:]}")
-        inject_nopecha_key(sb, cdk)
-        return cdk
 
-    log("INFO", "📭 私信无可用 CDK，去频道发送命令领取...")
+    log("INFO", "📭 无24h内的 CDK，去频道发送命令领取...")
     cdk = send_command_and_poll(sb)
     if not cdk:
         msg = "❌ 未能获取 CDK，请检查 Discord"
@@ -425,12 +421,19 @@ def ensure_cdk(sb):
 # ── 页面状态解析 ──────────────────────────────────────────
 
 def is_signed(html):
-    """仅信任明确状态，删除模糊分支，宁可漏判也不错判。"""
     m = re.search(r"今日签到状态：\s*([^\n<]+)", html)
     if m:
-        return m.group(1).strip() == "已签到"
-    # 兜底：明确的成功文案
-    return "签到成功" in html
+        status = m.group(1).strip()
+        if status == "已签到":
+            return True
+        if status == "未签到":
+            return False
+
+    if "签到成功" in html and "今日签到状态" not in html:
+        return True
+    if "未签到" not in html and "当前连续签到" in html:
+        return True
+    return False
 
 
 def extract_points(html):
