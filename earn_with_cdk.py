@@ -120,18 +120,8 @@ def get_element_screen_pos(sb, selector: str):
 # ── 读取页面文字 ──────────────────────────────────────────
 
 def get_page_text(sb) -> str:
-    # 修复点：Discord 是重型 SPA，页面没加载完就注入同步 JS 会触发 script timeout。
-    # 先等 readyState=complete，再读取；读不到就重试几次，避免误判「无 CDK」。
-    for _ in range(3):
-        try:
-            sb.wait_for_ready_state_complete()
-        except Exception:
-            pass
-        result = js_eval(sb, "document.body.innerText")
-        if result:
-            return result
-        time.sleep(3)
-    return ""
+    result = js_eval(sb, "document.body.innerText")
+    return result or ""
 
 
 # ── 读取账户当前总金币余额 ───────────────────────────────────
@@ -495,12 +485,6 @@ def main():
             "--window-size=1280,900"
         ),
     ) as sb:
-
-        # 修复点：调高 script timeout，避免重型 SPA 下同步 JS 偶发超时
-        try:
-            sb.set_script_timeout(60)
-        except Exception:
-            pass
 
         # ── Step 1: 确保 CDK 有效并注入 ──────────────────
         log("📂 打开 Discord 频道...")
