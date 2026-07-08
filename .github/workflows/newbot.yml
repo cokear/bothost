@@ -69,7 +69,7 @@ jobs:
 
       - name: 7. 执行自动续期脚本 (newbost.py)
         env:
-          PROXY_STR:             ${{ secrets.PROXY_STR }}
+          PROXY_STR:             ${{ secrets.PROXY_N }}
           NOPECHA_KEY:           ${{ secrets.NOPECHA_KEY }}
           TG_BOT_TOKEN:          ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:            ${{ secrets.TG_CHAT_ID }}
