@@ -45,7 +45,6 @@ def send_tg(message):
 
 
 def send_tg_screenshot(sb, caption="debug"):
-    """截图并发送到 Telegram"""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
@@ -61,58 +60,6 @@ def send_tg_screenshot(sb, caption="debug"):
         os.remove(path)
     except Exception as e:
         log(f"⚠️ 截图推送失败: {e}")
-
-
-# ── Cloudflare 处理（UC 模式）─────────────────────────────
-
-def is_cloudflare_page(sb) -> bool:
-    """检测当前页面是否是 Cloudflare 挑战页"""
-    cf_keywords = [
-        'performing security verification',
-        'verify you are human',
-        'just a moment',
-        'checking if the site connection is secure',
-        'attention required',
-    ]
-    text = js_eval(sb, 'document.body?.innerText?.substring(0, 500)') or ''
-    title = (sb.get_title() or '').lower()
-    return any(kw in text.lower() or kw in title for kw in cf_keywords)
-
-
-def handle_cloudflare(sb, url, max_attempts=3):
-    """
-    打开页面并处理 Cloudflare 挑战。
-    使用 UC 模式的 uc_gui_click_captcha() 自动点击 Turnstile。
-    """
-    for attempt in range(max_attempts):
-        log(f"  → 打开 {url}（第 {attempt+1} 次）")
-        sb.open(url)
-        time.sleep(5)
-
-        if not is_cloudflare_page(sb):
-            log("  ✅ 无 Cloudflare 挑战，页面正常")
-            return True
-
-        log("  ⚡ 检测到 Cloudflare Turnstile，使用 UC 模式点击...")
-        try:
-            sb.uc_gui_click_captcha()
-            log("  ✅ uc_gui_click_captcha 执行完成")
-            time.sleep(3)
-
-            # 验证是否已通过
-            if not is_cloudflare_page(sb):
-                log("  ✅ Cloudflare 已通过")
-                return True
-            else:
-                log(f"  ⚠️ 仍在 Cloudflare 页面，重试...")
-                time.sleep(5)
-        except Exception as e:
-            log(f"  ⚠️ uc_gui_click_captcha 异常: {e}")
-            time.sleep(5)
-
-    log(f"  ❌ Cloudflare 处理失败（{max_attempts} 次尝试）")
-    send_tg_screenshot(sb, "cf_failed")
-    return False
 
 
 # ── JS 执行辅助 ───────────────────────────────────────────
@@ -198,7 +145,6 @@ def get_page_text(sb) -> str:
 # ── 读取账户当前总金币余额 ───────────────────────────────────
 
 def get_total_coins(sb) -> str:
-    """尽力读取面板上的总金币余额。页面结构变化时请调整下方选择器。"""
     selectors = [
         '.maintitle span', 'h1.maintitle span',
         '#coins', '.coins', '[data-coins]',
@@ -230,7 +176,7 @@ def get_total_coins(sb) -> str:
     return "未知"
 
 
-# ── CDK 提取（取最后一条，判断是否24h内）────────────────
+# ── CDK 提取 ─────────────────────────────────────────────
 
 def extract_latest_cdk(text: str):
     pattern = re.findall(
@@ -300,7 +246,7 @@ def send_command_and_poll(sb) -> str:
     return ''
 
 
-# ── CDK 获取主逻辑（有则直接用，无则发命令）─────────────
+# ── CDK 获取主逻辑 ────────────────────────────────────────
 
 def ensure_cdk(sb) -> str:
     log("=" * 50)
@@ -321,7 +267,7 @@ def ensure_cdk(sb) -> str:
     cdk, is_recent = extract_latest_cdk(page_text) if page_text else ('', False)
 
     if cdk and is_recent:
-        log(f"✅ 已有24h内的 CDK，直接注入，无需发送命令: {cdk[:4]}****{cdk[-4:]}")
+        log(f"✅ 已有24h内的 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
         inject_nopecha_key(sb, cdk)
         return cdk
 
@@ -336,6 +282,56 @@ def ensure_cdk(sb) -> str:
 
     inject_nopecha_key(sb, cdk)
     return cdk
+
+
+# ── 关闭 cookie 同意弹窗 ─────────────────────────────────
+
+def dismiss_cookie_consent(sb):
+    """关闭可能遮挡页面的 cookie/privacy 弹窗"""
+    log("  → 检查 cookie 弹窗...")
+    try:
+        # 常见的 accept/同意按钮选择器
+        for selector in [
+            'button:has-text("Accept")',
+            'button:has-text("Accept All")',
+            'button:has-text("I Accept")',
+            'button:has-text("同意")',
+            '#accept-cookies',
+            '.cookie-accept',
+            'button.fc-cta-consent',
+            'button[aria-label="Accept"]',
+        ]:
+            try:
+                btn = sb.find_element(selector, timeout=2)
+                if btn and btn.is_displayed():
+                    btn.click()
+                    log(f"  ✓ 已关闭 cookie 弹窗: {selector}")
+                    time.sleep(2)
+                    return True
+            except:
+                pass
+
+        # 兜底：用 JS 查找包含 "Accept" 文字的按钮
+        clicked = js_eval(sb,
+            '(function(){'
+            '  var btns = document.querySelectorAll("button");'
+            '  for (var b of btns) {'
+            '    if (b.offsetParent && /^\\s*accept/i.test(b.innerText.trim())) {'
+            '      b.click(); return true;'
+            '    }'
+            '  }'
+            '  return false;'
+            '})()'
+        )
+        if clicked:
+            log("  ✓ 已通过 JS 点击 Accept 按钮")
+            time.sleep(2)
+            return True
+
+        log("  → 未检测到 cookie 弹窗")
+    except Exception as e:
+        log(f"  ⚠️ 关闭 cookie 弹窗异常: {e}")
+    return False
 
 
 # ── 强制关闭残留弹窗 ──────────────────────────────────────
@@ -421,62 +417,36 @@ def check_button_ready(sb, max_retries=3) -> bool:
     for i in range(max_retries):
         try:
             log(f"  → 检查按钮状态 ({i+1}/{max_retries})...")
+            sb.wait_for_element(selector, timeout=10)
+            btn  = sb.find_element(selector)
+            text = btn.text.strip()
+            log(f"  按钮文本: '{text}'")
 
-            # 用 JS 直接查 DOM，绕过 Selenium 可见性检查
-            btn_info = js_eval(sb,
-                f'(function(){{'
-                f'  var el = document.querySelector("{safe_selector}");'
-                f'  if (!el) return null;'
-                f'  return {{'
-                f'    text: el.innerText.trim(),'
-                f'    disabled: el.disabled,'
-                f'    displayed: el.offsetParent !== null'
-                f'  }};'
-                f'}})()'
-            )
-
-            if not btn_info:
-                log(f"  ⚠️ 按钮不在 DOM 中，等待 5 秒重试...")
-                time.sleep(5)
-                continue
-
-            log(f"  按钮: {btn_info}")
-
-            if not btn_info['disabled']:
+            if btn.is_enabled():
                 log("  ✓ 按钮可用")
                 return True
 
-            if "complete the captcha" in btn_info['text'].lower():
+            if "complete the captcha" in text.lower():
                 log("  ⚠️ 需要 hCaptcha，等待 NopeCHA 插件自动解决...")
-                for wait_round in range(20):
+                for _ in range(20):
                     time.sleep(3)
-                    info = js_eval(sb,
-                        f'(function(){{'
-                        f'  var e = document.querySelector("{safe_selector}");'
-                        f'  if (!e) return null;'
-                        f'  return {{disabled: e.disabled, text: e.innerText.trim()}};'
-                        f'}})()'
-                    )
-                    if info and not info['disabled']:
+                    btn = sb.find_element(selector)
+                    if btn.is_enabled():
                         log("  ✓ hCaptcha 已自动解决，按钮可用")
                         return True
-                    if wait_round % 5 == 4:
-                        log(f"  ⏳ 已等待 {(wait_round+1)*3}s ...")
                 log("  ⚠️ 等待超时，hCaptcha 未解决")
-                send_tg_screenshot(sb, "hcaptcha_timeout")
                 return False
 
-            elif "you are on cooldown" in btn_info['text'].lower():
+            elif "you are on cooldown" in text.lower():
                 log("  ⚠️ 冷却中")
                 return False
             else:
-                log(f"  ⚠️ 按钮 disabled（其他原因）: {btn_info['text']}")
+                log("  ⚠️ 按钮 disabled（其他原因）")
                 return False
 
         except Exception as e:
-            log(f"  ⚠️ 检查按钮异常: {e}")
-            send_tg_screenshot(sb, f"check_btn_error_{i}")
-            time.sleep(5)
+            log(f"  ⚠️ 检查按钮失败: {e}")
+            return False
 
     return False
 
@@ -485,7 +455,6 @@ def check_button_ready(sb, max_retries=3) -> bool:
 
 def click_claim_coins(sb, max_attempts=15):
     selector       = 'button.btn.green[type="submit"]'
-    safe_selector  = selector.replace('"', '\\"')
     total_coins    = 10
     claimed_so_far = 0
     task_completed = False
@@ -505,14 +474,8 @@ def click_claim_coins(sb, max_attempts=15):
 
         if not check_button_ready(sb):
             try:
-                btn_info = js_eval(sb,
-                    f'(function(){{'
-                    f'  var e = document.querySelector("{safe_selector}");'
-                    f'  return e ? e.innerText.trim() : "不存在";'
-                    f'}})()'
-                )
-                log(f"  按钮状态: {btn_info}")
-                if btn_info and "cooldown" in btn_info.lower():
+                btn = sb.find_element(selector)
+                if "you are on cooldown" in btn.text.lower():
                     log("  → 冷却等待 35 秒...")
                     time.sleep(35)
                     continue
@@ -522,23 +485,16 @@ def click_claim_coins(sb, max_attempts=15):
             continue
 
         try:
-            # 用 JS 直接点击，绕过 Selenium 交互
-            clicked = js_eval(sb,
-                f'(function(){{'
-                f'  var e = document.querySelector("{safe_selector}");'
-                f'  if (e) {{ e.click(); return true; }}'
-                f'  return false;'
-                f'}})()'
-            )
-            if clicked:
-                log("  ✓ 已点击（JS）")
-            else:
-                btn = sb.find_element(selector)
-                btn.click()
-                log("  ✓ 已点击（Selenium）")
+            btn = sb.find_element(selector)
+            if not btn.is_enabled():
+                log("  ⚠️ 按钮不可用，跳过")
+                time.sleep(8)
+                continue
+            log("  → 点击领取按钮...")
+            btn.click()
+            log("  ✓ 已点击")
         except Exception as e:
             log(f"  ⚠️ 点击失败: {e}")
-            send_tg_screenshot(sb, f"click_fail_{attempt}")
             time.sleep(8)
             continue
 
@@ -556,7 +512,6 @@ def click_claim_coins(sb, max_attempts=15):
                 task_completed = True
         else:
             log("  ⚠️ 无法获取进度")
-            send_tg_screenshot(sb, f"no_progress_{attempt}")
 
         time.sleep(1 if task_completed else 10)
 
@@ -585,7 +540,7 @@ def main():
         headed=True,
         headless=False,
         xvfb=False,
-        uc=True,               # ← UC 模式，绕过自动化检测
+        uc=True,
         user_data_dir=PROFILE_DIR,
         extension_dir=NOPECHA_EXT_DIR,
         proxy=PROXY_URL if PROXY_URL else None,
@@ -611,15 +566,22 @@ def main():
 
         # ── Step 2: 领取 Bot-Hosting 金币 ────────────────
         log(f"\n→ 访问 {TARGET_URL}")
+        sb.open(TARGET_URL)
+        time.sleep(5)
 
-        # UC 模式处理 Cloudflare
-        if not handle_cloudflare(sb, TARGET_URL, max_attempts=3):
-            msg = "❌ Cloudflare 验证失败，无法访问 bot-hosting"
-            log(msg)
-            send_tg(msg)
-            return
+        # UC 模式：检测并处理 Cloudflare
+        cf_text = js_eval(sb, 'document.body?.innerText?.substring(0, 300)') or ''
+        if 'security verification' in cf_text.lower() or 'just a moment' in cf_text.lower():
+            log("  ⚡ 检测到 Cloudflare，尝试 UC 点击...")
+            try:
+                sb.uc_gui_click_captcha()
+                time.sleep(5)
+                log("  ✓ UC captcha 处理完成")
+            except Exception as e:
+                log(f"  ⚠️ UC captcha 异常: {e}")
+                time.sleep(10)
 
-        send_tg_screenshot(sb, "panel_ready")
+        send_tg_screenshot(sb, "panel_status")
         log(f"  当前 URL: {sb.get_current_url()}")
 
         log("→ 写入 localStorage token")
@@ -627,42 +589,22 @@ def main():
         log("  ✓ token 已写入")
 
         log(f"→ 跳转到 {EARN_URL}")
+        sb.open(EARN_URL)
+        time.sleep(5)
 
         # earn 页面也可能触发 Cloudflare
-        if not handle_cloudflare(sb, EARN_URL, max_attempts=2):
-            msg = "❌ earn 页面 Cloudflare 验证失败"
-            log(msg)
-            send_tg(msg)
-            return
+        cf_text = js_eval(sb, 'document.body?.innerText?.substring(0, 300)') or ''
+        if 'security verification' in cf_text.lower() or 'just a moment' in cf_text.lower():
+            log("  ⚡ earn 页面 Cloudflare，尝试 UC 点击...")
+            try:
+                sb.uc_gui_click_captcha()
+                time.sleep(5)
+            except:
+                time.sleep(10)
 
-        # 等页面 DOM 加载
-        for _ in range(10):
-            time.sleep(3)
-            has_btn = js_eval(sb,
-                '(function(){'
-                '  return !!document.querySelector(\'button.btn.green[type="submit"]\')'
-                '      || !!document.querySelector(".earnBox, .maintitle");'
-                '})()'
-            )
-            if has_btn:
-                break
-
-        send_tg_screenshot(sb, "earn_page_ready")
-        log(f"  当前 URL: {sb.get_current_url()}")
-
-        # 诊断按钮状态
-        btn_diag = js_eval(sb,
-            '(function(){'
-            '  var el = document.querySelector(\'button.btn.green[type="submit"]\');'
-            '  if (!el) return "按钮不在 DOM 中";'
-            '  var r = el.getBoundingClientRect();'
-            '  return "text=" + el.innerText.trim() +'
-            '    " disabled=" + el.disabled +'
-            '    " visible=" + (r.width > 0 && r.height > 0) +'
-            '    rect=" + JSON.stringify({t:Math.round(r.top),l:Math.round(r.left),w:Math.round(r.width),h:Math.round(r.height)});'
-            '})()'
-        )
-        log(f"  诊断: {btn_diag}")
+        # 关闭 cookie 同意弹窗（遮挡 hCaptcha）
+        dismiss_cookie_consent(sb)
+        time.sleep(2)
 
         log("→ 检查初始按钮状态")
         check_button_ready(sb, max_retries=2)
