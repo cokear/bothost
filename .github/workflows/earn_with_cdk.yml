@@ -28,12 +28,16 @@ jobs:
       - name: 3. 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -U seleniumbase requests
+          pip install -U DrissionPage requests
           sudo apt-get update -qq
           sudo apt-get install -y xvfb xdotool
-          seleniumbase install chromedriver
-          seleniumbase install chrome
           echo "✅ 依赖安装完成"
+
+      - name: 3.5 安装 Chrome for Testing
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+        id: setup-chrome
 
       - name: 4. 还原 Chrome Profile（含 Discord 登录态 + NopeCHA key）
         uses: actions/cache/restore@v4
@@ -78,4 +82,4 @@ jobs:
           if [ -n "$PROXY_STR" ]; then
             export BROWSER_PROXY="http://127.0.0.1:8080"
           fi
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python earn_with_cdk.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python earn_coins_dp.py
