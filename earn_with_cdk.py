@@ -585,7 +585,7 @@ def main():
         headed=True,
         headless=False,
         xvfb=False,
-        undetect=True,          # ← UC 模式，绕过自动化检测
+        uc=True,               # ← UC 模式，绕过自动化检测
         user_data_dir=PROFILE_DIR,
         extension_dir=NOPECHA_EXT_DIR,
         proxy=PROXY_URL if PROXY_URL else None,
