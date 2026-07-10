@@ -287,72 +287,48 @@ def ensure_cdk(sb) -> str:
 # ── 关闭 cookie 同意弹窗（用 xdotool 物理点击）────────────
 
 def dismiss_cookie_consent(sb):
-    """关闭可能遮挡页面的 cookie/privacy 弹窗，用 xdotool 物理点击"""
+    """关闭 cookie 弹窗"""
     log("  → 检查 cookie 弹窗...")
+    try:
+        time.sleep(2)
 
-    # 先用 JS 找到 Accept 按钮的位置
-    btn_pos = js_eval(sb,
-        '(function(){'
-        '  var btns = document.querySelectorAll("button");'
-        '  for (var b of btns) {'
-        '    var t = b.innerText.trim().toLowerCase();'
-        '    if (b.offsetParent && (t === "accept" || t === "accept all" || t === "i accept")) {'
-        '      var r = b.getBoundingClientRect();'
-        '      return {x: r.left + r.width/2, y: r.top + r.height/2};'
-        '    }'
-        '  }'
-        '  return null;'
-        '})()'
-    )
+        # 方案1：直接调用页面的 onclick 函数
+        called = js_eval(sb, '(function(){ try { __ncmp("save"); return true; } catch(e) { return false; } })()')
+        if called:
+            log("  ✓ 已调用 __ncmp('save')")
+            time.sleep(3)
+            return True
 
-    if not btn_pos:
+        # 方案2：Selenium 点击 Accept 按钮
+        try:
+            btn = sb.wait_for_element('button.ncmp__btn:not(.ncmp__btn-border)', timeout=5)
+            if btn:
+                btn.click()
+                log("  ✓ 已点击 Accept 按钮")
+                time.sleep(3)
+                return True
+        except:
+            pass
+
+        # 方案3：JS 点击
+        clicked = js_eval(sb,
+            '(function(){'
+            '  var btns = document.querySelectorAll("button.ncmp__btn");'
+            '  for (var b of btns) {'
+            '    if (b.innerText.trim() === "Accept") { b.click(); return true; }'
+            '  }'
+            '  return false;'
+            '})()'
+        )
+        if clicked:
+            log("  ✓ 已通过 JS 点击 Accept")
+            time.sleep(3)
+            return True
+
         log("  → 未检测到 cookie 弹窗")
-        return False
-
-    log(f"  找到 Accept 按钮，坐标: ({btn_pos['x']}, {btn_pos['y']})")
-
-    # 获取浏览器窗口偏移量
-    win_offset = js_eval(sb,
-        '(function(){'
-        '  return {'
-        '    sx: window.screenX || 0,'
-        '    sy: window.screenY || 0,'
-        '    dh: window.outerHeight - window.innerHeight,'
-        '    dw: (window.outerWidth - window.innerWidth) / 2'
-        '  };'
-        '})()'
-    )
-
-    if win_offset:
-        screen_x = int(btn_pos['x'] + win_offset.get('sx', 0) + win_offset.get('dw', 0))
-        screen_y = int(btn_pos['y'] + win_offset.get('sy', 0) + win_offset.get('dh', 0))
-    else:
-        screen_x = int(btn_pos['x'])
-        screen_y = int(btn_pos['y'])
-
-    # 用 xdotool 物理点击
-    mouse_click(screen_x, screen_y, "Accept cookie 弹窗")
-    time.sleep(3)
-
-    # 验证弹窗是否消失
-    still_there = js_eval(sb,
-        '(function(){'
-        '  var btns = document.querySelectorAll("button");'
-        '  for (var b of btns) {'
-        '    var t = b.innerText.trim().toLowerCase();'
-        '    if (b.offsetParent && (t === "accept" || t === "accept all")) return true;'
-        '  }'
-        '  return false;'
-        '})()'
-    )
-
-    if still_there:
-        log("  ⚠️ 弹窗仍在，再试一次...")
-        mouse_click(screen_x, screen_y, "Accept cookie 弹窗 (重试)")
-        time.sleep(3)
-
-    log("  ✓ cookie 弹窗处理完成")
-    return True
+    except Exception as e:
+        log(f"  ⚠️ 关闭 cookie 弹窗异常: {e}")
+    return False
 
 
 # ── 强制关闭残留弹窗 ──────────────────────────────────────
@@ -600,24 +576,27 @@ def main():
         sb.open(TARGET_URL)
         time.sleep(8)
 
-        # 检测 Cloudflare 挑战
+        # 检测 Cloudflare 挑战，用 UC 模式自动点击
         page_text = get_page_text(sb)
         if 'security verification' in page_text.lower() or 'just a moment' in page_text.lower():
-            log("  ⚡ 检测到 Cloudflare，等待 15 秒让插件处理...")
-            send_tg("⚡ 检测到 Cloudflare 验证，等待通过中...")
-            time.sleep(15)
-            # 再检查一次
-            page_text = get_page_text(sb)
-            if 'security verification' in page_text.lower():
-                log("  ❌ Cloudflare 未通过，截图推送TG，请手动处理")
-                send_tg_screenshot(sb, "cf_stuck")
-                # 继续等待，给插件更多时间
-                time.sleep(30)
-                page_text = get_page_text(sb)
-                if 'security verification' in page_text.lower():
-                    log("  ❌ Cloudflare 仍然未通过，放弃")
-                    send_tg("❌ Cloudflare 验证超时，无法继续")
-                    return
+            log("  ⚡ 检测到 Cloudflare，UC 模式点击 Turnstile...")
+            for cf_attempt in range(3):
+                try:
+                    sb.uc_gui_click_captcha()
+                    time.sleep(5)
+                    page_text = get_page_text(sb)
+                    if 'security verification' not in page_text.lower():
+                        log("  ✅ Cloudflare 已通过")
+                        break
+                    log(f"  ⚠️ CF 未通过，重试 ({cf_attempt+1}/3)...")
+                except Exception as e:
+                    log(f"  ⚠️ uc_gui_click_captcha 异常: {e}")
+                    time.sleep(5)
+            else:
+                log("  ❌ Cloudflare 验证失败")
+                send_tg_screenshot(sb, "cf_failed")
+                send_tg("❌ Cloudflare 验证失败，无法继续")
+                return
 
         log("  ✅ 页面已加载")
 
@@ -635,18 +614,22 @@ def main():
         # earn 页面也可能有 Cloudflare
         page_text = get_page_text(sb)
         if 'security verification' in page_text.lower():
-            log("  ⚡ earn 页面 Cloudflare，等待...")
-            time.sleep(15)
+            log("  ⚡ earn 页面 Cloudflare，UC 点击...")
+            try:
+                sb.uc_gui_click_captcha()
+                time.sleep(5)
+            except:
+                time.sleep(10)
 
-        # 关闭 cookie 弹窗（用 xdotool 物理点击）
+        # 关闭 cookie 弹窗（Selenium 直接点击）
+        dismiss_cookie_consent(sb)
+        time.sleep(2)
+        # 再检查一次，有时弹窗会重新出现
         dismiss_cookie_consent(sb)
         time.sleep(3)
 
-        # 再关一次可能的残留弹窗
-        dismiss_cookie_consent(sb)
-        time.sleep(2)
-
-        send_tg_screenshot(sb, "earn_ready")
+        # 截图确认弹窗已关闭
+        send_tg_screenshot(sb, "after_cookie_dismiss")
 
         log("→ 检查初始按钮状态")
         check_button_ready(sb, max_retries=2)
