@@ -284,71 +284,75 @@ def ensure_cdk(sb) -> str:
     return cdk
 
 
-# ── 关闭 cookie 同意弹窗 ─────────────────────────────────
+# ── 关闭 cookie 同意弹窗（用 xdotool 物理点击）────────────
 
 def dismiss_cookie_consent(sb):
-    """关闭可能遮挡页面的 cookie/privacy 弹窗"""
+    """关闭可能遮挡页面的 cookie/privacy 弹窗，用 xdotool 物理点击"""
     log("  → 检查 cookie 弹窗...")
-    try:
-        # 方案1：直接用 Selenium 点 Accept 按钮
-        for selector in [
-            'button.fc-cta-consent',
-            'button[aria-label="Accept"]',
-            '#accept-cookies',
-        ]:
-            try:
-                btn = sb.find_element(selector, timeout=3)
-                if btn and btn.is_displayed():
-                    btn.click()
-                    log(f"  ✓ 已点击 Accept: {selector}")
-                    time.sleep(3)
-                    return True
-            except:
-                pass
 
-        # 方案2：JS 找 Accept 按钮并点击
-        for _ in range(3):
-            clicked = js_eval(sb,
-                '(function(){'
-                '  var btns = document.querySelectorAll("button");'
-                '  for (var b of btns) {'
-                '    var t = b.innerText.trim().toLowerCase();'
-                '    if (b.offsetParent && (t === "accept" || t === "accept all" || t === "i accept")) {'
-                '      b.click(); return true;'
-                '    }'
-                '  }'
-                '  return false;'
-                '})()'
-            )
-            if clicked:
-                log("  ✓ 已通过 JS 点击 Accept 按钮")
-                time.sleep(3)
-                # 确认弹窗消失
-                still_there = js_eval(sb,
-                    '(function(){'
-                    '  var btns = document.querySelectorAll("button");'
-                    '  for (var b of btns) {'
-                    '    var t = b.innerText.trim().toLowerCase();'
-                    '    if (b.offsetParent && (t === "accept" || t === "accept all")) return true;'
-                    '  }'
-                    '  return false;'
-                    '})()'
-                )
-                if not still_there:
-                    return True
-                log("  ⚠️ 弹窗仍在，重试...")
-                time.sleep(2)
-            else:
-                break
+    # 先用 JS 找到 Accept 按钮的位置
+    btn_pos = js_eval(sb,
+        '(function(){'
+        '  var btns = document.querySelectorAll("button");'
+        '  for (var b of btns) {'
+        '    var t = b.innerText.trim().toLowerCase();'
+        '    if (b.offsetParent && (t === "accept" || t === "accept all" || t === "i accept")) {'
+        '      var r = b.getBoundingClientRect();'
+        '      return {x: r.left + r.width/2, y: r.top + r.height/2};'
+        '    }'
+        '  }'
+        '  return null;'
+        '})()'
+    )
 
-        # 方案3：按 Escape 关闭
-        keyboard_key("Escape")
-        time.sleep(2)
-
+    if not btn_pos:
         log("  → 未检测到 cookie 弹窗")
-    except Exception as e:
-        log(f"  ⚠️ 关闭 cookie 弹窗异常: {e}")
-    return False
+        return False
+
+    log(f"  找到 Accept 按钮，坐标: ({btn_pos['x']}, {btn_pos['y']})")
+
+    # 获取浏览器窗口偏移量
+    win_offset = js_eval(sb,
+        '(function(){'
+        '  return {'
+        '    sx: window.screenX || 0,'
+        '    sy: window.screenY || 0,'
+        '    dh: window.outerHeight - window.innerHeight,'
+        '    dw: (window.outerWidth - window.innerWidth) / 2'
+        '  };'
+        '})()'
+    )
+
+    if win_offset:
+        screen_x = int(btn_pos['x'] + win_offset.get('sx', 0) + win_offset.get('dw', 0))
+        screen_y = int(btn_pos['y'] + win_offset.get('sy', 0) + win_offset.get('dh', 0))
+    else:
+        screen_x = int(btn_pos['x'])
+        screen_y = int(btn_pos['y'])
+
+    # 用 xdotool 物理点击
+    mouse_click(screen_x, screen_y, "Accept cookie 弹窗")
+    time.sleep(3)
+
+    # 验证弹窗是否消失
+    still_there = js_eval(sb,
+        '(function(){'
+        '  var btns = document.querySelectorAll("button");'
+        '  for (var b of btns) {'
+        '    var t = b.innerText.trim().toLowerCase();'
+        '    if (b.offsetParent && (t === "accept" || t === "accept all")) return true;'
+        '  }'
+        '  return false;'
+        '})()'
+    )
+
+    if still_there:
+        log("  ⚠️ 弹窗仍在，再试一次...")
+        mouse_click(screen_x, screen_y, "Accept cookie 弹窗 (重试)")
+        time.sleep(3)
+
+    log("  ✓ cookie 弹窗处理完成")
+    return True
 
 
 # ── 强制关闭残留弹窗 ──────────────────────────────────────
@@ -439,7 +443,12 @@ def check_button_ready(sb, max_retries=3) -> bool:
             text = btn.text.strip()
             log(f"  按钮文本: '{text}'")
 
-            if btn.is_enabled():
+            # 用 JS 检查 disabled，兼容 UC 模式
+            enabled = js_eval(sb,
+                f'!document.querySelector("{safe_selector}").disabled'
+            )
+
+            if enabled:
                 log("  ✓ 按钮可用")
                 return True
 
@@ -447,8 +456,10 @@ def check_button_ready(sb, max_retries=3) -> bool:
                 log("  ⚠️ 需要 hCaptcha，等待 NopeCHA 插件自动解决...")
                 for _ in range(20):
                     time.sleep(3)
-                    btn = sb.find_element(selector)
-                    if btn.is_enabled():
+                    enabled = js_eval(sb,
+                        f'!document.querySelector("{safe_selector}").disabled'
+                    )
+                    if enabled:
                         log("  ✓ hCaptcha 已自动解决，按钮可用")
                         return True
                 log("  ⚠️ 等待超时，hCaptcha 未解决")
@@ -472,6 +483,7 @@ def check_button_ready(sb, max_retries=3) -> bool:
 
 def click_claim_coins(sb, max_attempts=15):
     selector       = 'button.btn.green[type="submit"]'
+    safe_selector  = selector.replace('"', '\\"')
     total_coins    = 10
     claimed_so_far = 0
     task_completed = False
@@ -502,12 +514,14 @@ def click_claim_coins(sb, max_attempts=15):
             continue
 
         try:
-            btn = sb.find_element(selector)
-            if not btn.is_enabled():
+            # 用 JS 检查 disabled，兼容 UC 模式
+            enabled = js_eval(sb, f'!document.querySelector("{safe_selector}").disabled')
+            if not enabled:
                 log("  ⚠️ 按钮不可用，跳过")
                 time.sleep(8)
                 continue
             log("  → 点击领取按钮...")
+            btn = sb.find_element(selector)
             btn.click()
             log("  ✓ 已点击")
         except Exception as e:
@@ -555,9 +569,9 @@ def main():
     with SB(
         browser="chrome",
         headed=True,
+        uc=True,
         headless=False,
         xvfb=False,
-        uc=True,
         user_data_dir=PROFILE_DIR,
         extension_dir=NOPECHA_EXT_DIR,
         proxy=PROXY_URL if PROXY_URL else None,
@@ -584,21 +598,30 @@ def main():
         # ── Step 2: 领取 Bot-Hosting 金币 ────────────────
         log(f"\n→ 访问 {TARGET_URL}")
         sb.open(TARGET_URL)
-        time.sleep(5)
+        time.sleep(8)
 
-        # UC 模式：检测并处理 Cloudflare
-        cf_text = js_eval(sb, 'document.body?.innerText?.substring(0, 300)') or ''
-        if 'security verification' in cf_text.lower() or 'just a moment' in cf_text.lower():
-            log("  ⚡ 检测到 Cloudflare，尝试 UC 点击...")
-            try:
-                sb.uc_gui_click_captcha()
-                time.sleep(5)
-                log("  ✓ UC captcha 处理完成")
-            except Exception as e:
-                log(f"  ⚠️ UC captcha 异常: {e}")
-                time.sleep(10)
+        # 检测 Cloudflare 挑战
+        page_text = get_page_text(sb)
+        if 'security verification' in page_text.lower() or 'just a moment' in page_text.lower():
+            log("  ⚡ 检测到 Cloudflare，等待 15 秒让插件处理...")
+            send_tg("⚡ 检测到 Cloudflare 验证，等待通过中...")
+            time.sleep(15)
+            # 再检查一次
+            page_text = get_page_text(sb)
+            if 'security verification' in page_text.lower():
+                log("  ❌ Cloudflare 未通过，截图推送TG，请手动处理")
+                send_tg_screenshot(sb, "cf_stuck")
+                # 继续等待，给插件更多时间
+                time.sleep(30)
+                page_text = get_page_text(sb)
+                if 'security verification' in page_text.lower():
+                    log("  ❌ Cloudflare 仍然未通过，放弃")
+                    send_tg("❌ Cloudflare 验证超时，无法继续")
+                    return
 
-        send_tg_screenshot(sb, "panel_status")
+        log("  ✅ 页面已加载")
+
+        send_tg_screenshot(sb, "panel_loaded")
         log(f"  当前 URL: {sb.get_current_url()}")
 
         log("→ 写入 localStorage token")
@@ -607,21 +630,23 @@ def main():
 
         log(f"→ 跳转到 {EARN_URL}")
         sb.open(EARN_URL)
-        time.sleep(5)
+        time.sleep(8)
 
-        # earn 页面也可能触发 Cloudflare
-        cf_text = js_eval(sb, 'document.body?.innerText?.substring(0, 300)') or ''
-        if 'security verification' in cf_text.lower() or 'just a moment' in cf_text.lower():
-            log("  ⚡ earn 页面 Cloudflare，尝试 UC 点击...")
-            try:
-                sb.uc_gui_click_captcha()
-                time.sleep(5)
-            except:
-                time.sleep(10)
+        # earn 页面也可能有 Cloudflare
+        page_text = get_page_text(sb)
+        if 'security verification' in page_text.lower():
+            log("  ⚡ earn 页面 Cloudflare，等待...")
+            time.sleep(15)
 
-        # 关闭 cookie 同意弹窗（遮挡 hCaptcha）
+        # 关闭 cookie 弹窗（用 xdotool 物理点击）
+        dismiss_cookie_consent(sb)
+        time.sleep(3)
+
+        # 再关一次可能的残留弹窗
         dismiss_cookie_consent(sb)
         time.sleep(2)
+
+        send_tg_screenshot(sb, "earn_ready")
 
         log("→ 检查初始按钮状态")
         check_button_ready(sb, max_retries=2)
