@@ -44,6 +44,25 @@ def send_tg(message):
         log(f"⚠️ TG 推送失败: {e}")
 
 
+def send_tg_screenshot(sb, caption="debug"):
+    """截图并发送到 Telegram"""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        path = f"/tmp/{caption}.png"
+        sb.save_screenshot(path)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+            data={"chat_id": TG_CHAT_ID, "caption": caption},
+            files={"photo": open(path, "rb")},
+            timeout=15
+        )
+        log(f"📸 截图已推送 TG: {caption}")
+        os.remove(path)
+    except Exception as e:
+        log(f"⚠️ 截图推送失败: {e}")
+
+
 # ── JS 执行辅助 ───────────────────────────────────────────
 
 def js_eval(sb, expr: str):
@@ -128,9 +147,8 @@ def get_page_text(sb) -> str:
 
 def get_total_coins(sb) -> str:
     """尽力读取面板上的总金币余额。页面结构变化时请调整下方选择器。"""
-    # 1) 优先尝试常见的余额显示元素选择器
     selectors = [
-        '.maintitle span', 'h1.maintitle span',   # ← 实测：余额显示在此
+        '.maintitle span', 'h1.maintitle span',
         '#coins', '.coins', '[data-coins]',
         '#coin-balance', '.coin-balance', '.balance',
         '.navbar .coins', 'span.coin-amount', '#coinAmount',
@@ -148,7 +166,6 @@ def get_total_coins(sb) -> str:
                 log(f"  💰 总金币余额: {coins}（选择器: {sel}）")
                 return coins
 
-    # 2) 兜底：从整页文字里正则匹配 "Coins: 1234" / "1234 Coins" / "金币 1234"
     text = get_page_text(sb)
     m = (re.search(r'(?:coins?|金币|积分)\s*[:：]?\s*([\d,]+)', text, re.IGNORECASE)
          or re.search(r'([\d,]+)\s*(?:coins?|金币|积分)', text, re.IGNORECASE))
@@ -351,36 +368,62 @@ def check_button_ready(sb, max_retries=3) -> bool:
     for i in range(max_retries):
         try:
             log(f"  → 检查按钮状态 ({i+1}/{max_retries})...")
-            sb.wait_for_element(selector, timeout=10)
-            btn  = sb.find_element(selector)
-            text = btn.text.strip()
-            log(f"  按钮文本: '{text}'")
 
-            if btn.is_enabled():
+            # 用 JS 直接查 DOM，绕过 Selenium 可见性检查
+            btn_info = js_eval(sb,
+                f'(function(){{'
+                f'  var el = document.querySelector("{selector}");'
+                f'  if (!el) return null;'
+                f'  return {{'
+                f'    text: el.innerText.trim(),'
+                f'    disabled: el.disabled,'
+                f'    displayed: el.offsetParent !== null'
+                f'  }};'
+                f'}})()'
+            )
+
+            if not btn_info:
+                log(f"  ⚠️ 按钮不在 DOM 中，等待 5 秒重试...")
+                time.sleep(5)
+                continue
+
+            log(f"  按钮: {btn_info}")
+
+            if not btn_info['disabled']:
                 log("  ✓ 按钮可用")
                 return True
 
-            if "complete the captcha" in text.lower():
+            if "complete the captcha" in btn_info['text'].lower():
                 log("  ⚠️ 需要 hCaptcha，等待 NopeCHA 插件自动解决...")
-                for _ in range(20):
+                for wait_round in range(20):
                     time.sleep(3)
-                    btn = sb.find_element(selector)
-                    if btn.is_enabled():
+                    info = js_eval(sb,
+                        f'(function(){{'
+                        f'  var e = document.querySelector("{selector}");'
+                        f'  if (!e) return null;'
+                        f'  return {{disabled: e.disabled, text: e.innerText.trim()}};'
+                        f'}})()'
+                    )
+                    if info and not info['disabled']:
                         log("  ✓ hCaptcha 已自动解决，按钮可用")
                         return True
+                    if wait_round % 5 == 4:
+                        log(f"  ⏳ 已等待 {(wait_round+1)*3}s ...")
                 log("  ⚠️ 等待超时，hCaptcha 未解决")
+                send_tg_screenshot(sb, "hcaptcha_timeout")
                 return False
 
-            elif "you are on cooldown" in text.lower():
+            elif "you are on cooldown" in btn_info['text'].lower():
                 log("  ⚠️ 冷却中")
                 return False
             else:
-                log("  ⚠️ 按钮 disabled（其他原因）")
+                log(f"  ⚠️ 按钮 disabled（其他原因）: {btn_info['text']}")
                 return False
 
         except Exception as e:
-            log(f"  ⚠️ 检查按钮失败: {e}")
-            return False
+            log(f"  ⚠️ 检查按钮异常: {e}")
+            send_tg_screenshot(sb, f"check_btn_error_{i}")
+            time.sleep(5)
 
     return False
 
@@ -408,8 +451,14 @@ def click_claim_coins(sb, max_attempts=15):
 
         if not check_button_ready(sb):
             try:
-                btn = sb.find_element(selector)
-                if "you are on cooldown" in btn.text.lower():
+                btn_info = js_eval(sb,
+                    f'(function(){{'
+                    f'  var e = document.querySelector("{selector}");'
+                    f'  return e ? e.innerText.trim() : "不存在";'
+                    f'}})()'
+                )
+                log(f"  按钮状态: {btn_info}")
+                if btn_info and "cooldown" in btn_info.lower():
                     log("  → 冷却等待 35 秒...")
                     time.sleep(35)
                     continue
@@ -419,16 +468,23 @@ def click_claim_coins(sb, max_attempts=15):
             continue
 
         try:
-            btn = sb.find_element(selector)
-            if not btn.is_enabled():
-                log("  ⚠️ 按钮不可用，跳过")
-                time.sleep(8)
-                continue
-            log("  → 点击领取按钮...")
-            btn.click()
-            log("  ✓ 已点击")
+            # 用 JS 直接点击，绕过 Selenium 交互
+            clicked = js_eval(sb,
+                f'(function(){{'
+                f'  var e = document.querySelector("{selector}");'
+                f'  if (e) {{ e.click(); return true; }}'
+                f'  return false;'
+                f'}})()'
+            )
+            if clicked:
+                log("  ✓ 已点击（JS）")
+            else:
+                btn = sb.find_element(selector)
+                btn.click()
+                log("  ✓ 已点击（Selenium）")
         except Exception as e:
             log(f"  ⚠️ 点击失败: {e}")
+            send_tg_screenshot(sb, f"click_fail_{attempt}")
             time.sleep(8)
             continue
 
@@ -446,6 +502,7 @@ def click_claim_coins(sb, max_attempts=15):
                 task_completed = True
         else:
             log("  ⚠️ 无法获取进度")
+            send_tg_screenshot(sb, f"no_progress_{attempt}")
 
         time.sleep(1 if task_completed else 10)
 
@@ -460,7 +517,6 @@ def click_claim_coins(sb, max_attempts=15):
 # ── 主流程 ────────────────────────────────────────────────
 
 def main():
-    # 预置默认值，避免异常路径下变量未定义
     success, claimed, total = False, 0, 0
     cdk = ""
     total_balance = "未知"
@@ -503,6 +559,10 @@ def main():
         sb.open(TARGET_URL)
         time.sleep(5)
 
+        # 截图诊断：登录页还是面板页
+        send_tg_screenshot(sb, "panel_after_token")
+        log(f"  当前 URL: {sb.get_current_url()}")
+
         log("→ 写入 localStorage token")
         sb.execute_script(f"localStorage.setItem('token', '{TOKEN}')")
         log("  ✓ token 已写入")
@@ -510,6 +570,24 @@ def main():
         log(f"→ 跳转到 {EARN_URL}")
         sb.open(EARN_URL)
         time.sleep(5)
+
+        # 截图诊断：earn 页面加载状态
+        send_tg_screenshot(sb, "earn_page_after_token")
+        log(f"  当前 URL: {sb.get_current_url()}")
+
+        # 诊断按钮状态
+        btn_diag = js_eval(sb,
+            '(function(){'
+            '  var el = document.querySelector(\'button.btn.green[type="submit"]\');'
+            '  if (!el) return "按钮不在 DOM 中";'
+            '  var r = el.getBoundingClientRect();'
+            '  return "text=" + el.innerText.trim() +'
+            '    " disabled=" + el.disabled +'
+            '    " visible=" + (r.width > 0 && r.height > 0) +'
+            '    " rect=" + JSON.stringify({t:Math.round(r.top),l:Math.round(r.left),w:Math.round(r.width),h:Math.round(r.height)});'
+            '})()'
+        )
+        log(f"  诊断: {btn_diag}")
 
         log("→ 检查初始按钮状态")
         check_button_ready(sb, max_retries=2)
