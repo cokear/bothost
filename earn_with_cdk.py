@@ -21,7 +21,7 @@ PROFILE_DIR     = os.getenv("BROWSER_USER_DATA_DIR",
 NOPECHA_EXT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium")
 
 DISCORD_CHANNEL_URL = "https://discord.com/channels/1046086326077882479/1243188924520726538"
-DISCORD_DM_URL      = "https://discord.com/channels/@me/1514785932203528202"
+DISCORD_DM_URL      = "https://discord.com/channels/@me/1519516877074731018"
 
 TARGET_URL = "https://legacy.bot-hosting.net/panel/"
 EARN_URL   = "https://legacy.bot-hosting.net/panel/earn"
@@ -183,18 +183,54 @@ def _cdp_click(page, vx, vy):
         return False
 
 
+def _cf_iframe_exists(page):
+    """检查 CF Turnstile iframe 是否仍在页面中"""
+    try:
+        result = page.run_js("""
+            return document.querySelectorAll(
+                'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"]'
+            ).length;
+        """)
+        return result and result > 0
+    except:
+        return False
+
+
+def _page_has_content(page):
+    """检查页面是否加载出了实际内容（排除 CF 挑战页即可）"""
+    try:
+        return page.run_js("""
+            var body = document.body;
+            if (!body) return false;
+            var text = body.innerText || '';
+            var html = body.innerHTML || '';
+            // 排除 CF 挑战页的各种关键词
+            var cfKeywords = [
+                'Just a moment', 'Attention Required', 'Verify you are human',
+                'Performing security verification', 'Checking if the site',
+                'challenge-platform', 'cf-chl-widget', 'cf-turnstile'
+            ];
+            for (var i = 0; i < cfKeywords.length; i++) {
+                if (text.indexOf(cfKeywords[i]) !== -1 || html.indexOf(cfKeywords[i]) !== -1) {
+                    return false;
+                }
+            }
+            // 页面有实际内容就算通过
+            return text.length > 50;
+        """) or False
+    except:
+        return False
+
+
 def wait_for_cloudflare(page, timeout=90):
     """等待并通过 Cloudflare Turnstile 验证"""
     start = time.time()
     click_count = 0
 
     while time.time() - start < timeout:
-        if _cf_passed(page):
-            log("  ✅ Cloudflare 已通过")
-            return True
-
-        if not _is_cf_page(page):
-            log("  ✅ 当前页面无 Cloudflare")
+        # 已通过：无 CF iframe + 页面有实际内容
+        if not _cf_iframe_exists(page) and _page_has_content(page):
+            log("  ✅ Cloudflare 已通过（页面已加载）")
             return True
 
         # 定位 CF iframe
@@ -209,15 +245,20 @@ def wait_for_cloudflare(page, timeout=90):
             _cdp_click(page, cx, cy)
             click_count += 1
 
-            # 等待 CF 消失
-            for _ in range(10):
+            # 等待 CF 真正消失 + 页面加载
+            for wait_i in range(20):
                 time.sleep(1)
-                if _cf_passed(page):
-                    log(f"  ✅ Cloudflare 通过（点击 {click_count} 次）")
+                iframe_gone = not _cf_iframe_exists(page)
+                page_loaded = _page_has_content(page)
+                if iframe_gone and page_loaded:
+                    log(f"  ✅ Cloudflare 通过（点击 {click_count} 次，{wait_i+1}s）")
                     return True
+                if wait_i % 5 == 4:
+                    log(f"  ⏳ 等待 CF 消失+页面加载... ({wait_i+1}s) iframe={not iframe_gone} content={page_loaded}")
 
             log(f"  ⚠️ 点击后未通过，重试...")
         else:
+            # 没找到 CF iframe，但页面也没内容，继续等
             time.sleep(2)
 
     log(f"  ❌ Cloudflare 验证超时（{timeout}s）")
@@ -720,8 +761,11 @@ def main():
 
     # 加载 NopeCHA 扩展
     if os.path.isdir(NOPECHA_EXT_DIR):
-        co.set_argument(f'--load-extension={NOPECHA_EXT_DIR}')
+        # DrissionPage 用 add_extension 加载扩展目录
+        co.add_extension(NOPECHA_EXT_DIR)
         log(f"📦 加载扩展: {NOPECHA_EXT_DIR}")
+    else:
+        log(f"⚠️ 扩展目录不存在: {NOPECHA_EXT_DIR}")
 
     if PROXY_URL:
         co.set_argument(f'--proxy-server={PROXY_URL}')
@@ -733,6 +777,21 @@ def main():
     except Exception as e:
         log(f"❌ 浏览器启动失败: {e}")
         return
+
+    # 检查扩展是否真的加载了
+    log("→ 检查浏览器扩展加载状态...")
+    try:
+        # 打开一个空白页来检查
+        page.get("chrome://extensions/")
+        time.sleep(3)
+        ext_html = page.run_js("return document.body.innerText;") or ""
+        if "nopecha" in ext_html.lower():
+            log("  ✅ NopeCHA 扩展已加载")
+        else:
+            log(f"  ⚠️ 未在扩展页面找到 NopeCHA")
+            log(f"  扩展页面内容: {ext_html[:200]}")
+    except Exception as e:
+        log(f"  ⚠️ 检查扩展状态失败: {e}")
 
     try:
         # ── Step 1: 确保 CDK 有效并注入 ──────────────────
@@ -759,10 +818,48 @@ def main():
         send_tg_screenshot(page, "panel_ready")
         log(f"  当前 URL: {page.url}")
 
+        # 写入 token — 先在当前页面写，确保域名正确
         log("→ 写入 localStorage token")
-        page.run_js(f"localStorage.setItem('token', '{TOKEN}')")
-        log("  ✓ token 已写入")
+        current_url = page.url or ''
+        log(f"  当前 URL: {current_url}")
 
+        # 确保在 bot-hosting 域名下
+        if 'bot-hosting.net' not in current_url:
+            page.get(TARGET_URL)
+            time.sleep(3)
+            if _is_cf_page(page):
+                wait_for_cloudflare(page, timeout=60)
+
+        # 写入 token
+        page.run_js(f"localStorage.setItem('token', '{TOKEN}')")
+        log("  ✓ token 已写入 localStorage")
+
+        # 同时写入 cookie 作为备份
+        page.run_js(f"""
+            document.cookie = 'token={TOKEN}; path=/; domain=.bot-hosting.net; max-age=86400';
+        """)
+        log("  ✓ token 已写入 cookie")
+
+        # 验证写入成功
+        verify = page.run_js("return localStorage.getItem('token');")
+        log(f"  验证 localStorage: {'✅ 已写入' if verify else '❌ 为空'}")
+
+        # 刷新让 token 生效
+        log("  → 刷新页面...")
+        page.refresh()
+        time.sleep(5)
+
+        # 检查登录状态
+        after_url = page.url or ''
+        log(f"  刷新后 URL: {after_url}")
+        if '/login' in after_url:
+            log("  ⚠️ 仍在登录页，尝试直接访问 panel...")
+            page.get(TARGET_URL)
+            time.sleep(5)
+            if _is_cf_page(page):
+                wait_for_cloudflare(page, timeout=60)
+
+        # 跳转到 earn
         log(f"→ 跳转到 {EARN_URL}")
         page.get(EARN_URL)
         time.sleep(5)
