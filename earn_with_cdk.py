@@ -44,53 +44,6 @@ def send_tg(message):
         log(f"⚠️ TG 推送失败: {e}")
 
 
-def wait_for_cloudflare(sb, timeout=120):
-    """等待 Cloudflare Turnstile 验证通过（靠插件自动解）"""
-    cf_indicators = [
-        'Performing security verification',
-        'Verify you are human',
-        'Just a moment',
-        'Checking if the site connection is secure',
-    ]
-
-    log("⏳ 检查 Cloudflare 挑战...")
-    for tick in range(timeout // 3):
-        time.sleep(3)
-        url = sb.get_current_url()
-        title = sb.get_title()
-        text = js_eval(sb, 'document.body?.innerText?.substring(0, 500)') or ''
-
-        is_cf = any(kw.lower() in text.lower() for kw in cf_indicators)
-        is_cf = is_cf or any(kw.lower() in title.lower() for kw in cf_indicators)
-
-        if not is_cf:
-            log(f"✅ Cloudflare 已通过（{tick*3}s）")
-            return True
-
-        # 尝试点击 Turnstile checkbox
-        clicked = js_eval(sb,
-            '(function(){'
-            '  var frames = document.querySelectorAll("iframe[src*=\\"turnstile\\"], iframe[src*=\\"challenges.cloudflare.com\\"]");'
-            '  for (var f of frames) {'
-            '    try { f.click(); return true; } catch(e) {}'
-            '  }'
-            '  var cb = document.querySelector(".cf-turnstile input, input[type=\\"checkbox\\"]");'
-            '  if (cb) { cb.click(); return true; }'
-            '  return false;'
-            '})()'
-        )
-        if clicked:
-            log(f"  🖱️ 已尝试点击 Turnstile checkbox")
-
-        if tick % 5 == 4:
-            log(f"  ⏳ Cloudflare 验证中... {(tick+1)*3}s / {timeout}s")
-            send_tg_screenshot(sb, f"cf_waiting_{(tick+1)*3}s")
-
-    log(f"⚠️ Cloudflare 验证超时（{timeout}s）")
-    send_tg_screenshot(sb, "cf_timeout")
-    return False
-
-
 def send_tg_screenshot(sb, caption="debug"):
     """截图并发送到 Telegram"""
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -110,37 +63,56 @@ def send_tg_screenshot(sb, caption="debug"):
         log(f"⚠️ 截图推送失败: {e}")
 
 
-def wait_for_page_ready(sb, timeout=30):
-    """等待页面 DOM 加载完成"""
-    for _ in range(timeout // 3):
-        time.sleep(3)
-        ready = js_eval(sb,
-            '(function(){'
-            '  var btn = document.querySelector(\'button.btn.green[type="submit"]\');'
-            '  if (btn) return true;'
-            '  var form = document.querySelector(".earnBox, .form, .maintitle");'
-            '  return !!form;'
-            '})()'
-        )
-        if ready:
+# ── Cloudflare 处理（UC 模式）─────────────────────────────
+
+def is_cloudflare_page(sb) -> bool:
+    """检测当前页面是否是 Cloudflare 挑战页"""
+    cf_keywords = [
+        'performing security verification',
+        'verify you are human',
+        'just a moment',
+        'checking if the site connection is secure',
+        'attention required',
+    ]
+    text = js_eval(sb, 'document.body?.innerText?.substring(0, 500)') or ''
+    title = (sb.get_title() or '').lower()
+    return any(kw in text.lower() or kw in title for kw in cf_keywords)
+
+
+def handle_cloudflare(sb, url, max_attempts=3):
+    """
+    打开页面并处理 Cloudflare 挑战。
+    使用 UC 模式的 uc_gui_click_captcha() 自动点击 Turnstile。
+    """
+    for attempt in range(max_attempts):
+        log(f"  → 打开 {url}（第 {attempt+1} 次）")
+        sb.open(url)
+        time.sleep(5)
+
+        if not is_cloudflare_page(sb):
+            log("  ✅ 无 Cloudflare 挑战，页面正常")
             return True
+
+        log("  ⚡ 检测到 Cloudflare Turnstile，使用 UC 模式点击...")
+        try:
+            sb.uc_gui_click_captcha()
+            log("  ✅ uc_gui_click_captcha 执行完成")
+            time.sleep(3)
+
+            # 验证是否已通过
+            if not is_cloudflare_page(sb):
+                log("  ✅ Cloudflare 已通过")
+                return True
+            else:
+                log(f"  ⚠️ 仍在 Cloudflare 页面，重试...")
+                time.sleep(5)
+        except Exception as e:
+            log(f"  ⚠️ uc_gui_click_captcha 异常: {e}")
+            time.sleep(5)
+
+    log(f"  ❌ Cloudflare 处理失败（{max_attempts} 次尝试）")
+    send_tg_screenshot(sb, "cf_failed")
     return False
-    """截图并发送到 Telegram"""
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    try:
-        path = f"/tmp/{caption}.png"
-        sb.save_screenshot(path)
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-            data={"chat_id": TG_CHAT_ID, "caption": caption},
-            files={"photo": open(path, "rb")},
-            timeout=15
-        )
-        log(f"📸 截图已推送 TG: {caption}")
-        os.remove(path)
-    except Exception as e:
-        log(f"⚠️ 截图推送失败: {e}")
 
 
 # ── JS 执行辅助 ───────────────────────────────────────────
@@ -613,6 +585,7 @@ def main():
         headed=True,
         headless=False,
         xvfb=False,
+        undetect=True,          # ← UC 模式，绕过自动化检测
         user_data_dir=PROFILE_DIR,
         extension_dir=NOPECHA_EXT_DIR,
         proxy=PROXY_URL if PROXY_URL else None,
@@ -638,17 +611,15 @@ def main():
 
         # ── Step 2: 领取 Bot-Hosting 金币 ────────────────
         log(f"\n→ 访问 {TARGET_URL}")
-        sb.open(TARGET_URL)
-        time.sleep(5)
 
-        # 等 Cloudflare Turnstile 验证通过
-        if not wait_for_cloudflare(sb, timeout=120):
-            msg = "❌ Cloudflare 验证超时，无法访问 bot-hosting"
+        # UC 模式处理 Cloudflare
+        if not handle_cloudflare(sb, TARGET_URL, max_attempts=3):
+            msg = "❌ Cloudflare 验证失败，无法访问 bot-hosting"
             log(msg)
             send_tg(msg)
             return
 
-        send_tg_screenshot(sb, "panel_after_cf")
+        send_tg_screenshot(sb, "panel_ready")
         log(f"  当前 URL: {sb.get_current_url()}")
 
         log("→ 写入 localStorage token")
@@ -656,18 +627,25 @@ def main():
         log("  ✓ token 已写入")
 
         log(f"→ 跳转到 {EARN_URL}")
-        sb.open(EARN_URL)
-        time.sleep(5)
 
-        # earn 页面也可能触发 Cloudflare，再等一次
-        if not wait_for_cloudflare(sb, timeout=60):
-            msg = "❌ earn 页面 Cloudflare 验证超时"
+        # earn 页面也可能触发 Cloudflare
+        if not handle_cloudflare(sb, EARN_URL, max_attempts=2):
+            msg = "❌ earn 页面 Cloudflare 验证失败"
             log(msg)
             send_tg(msg)
             return
 
         # 等页面 DOM 加载
-        wait_for_page_ready(sb, timeout=30)
+        for _ in range(10):
+            time.sleep(3)
+            has_btn = js_eval(sb,
+                '(function(){'
+                '  return !!document.querySelector(\'button.btn.green[type="submit"]\')'
+                '      || !!document.querySelector(".earnBox, .maintitle");'
+                '})()'
+            )
+            if has_btn:
+                break
 
         send_tg_screenshot(sb, "earn_page_ready")
         log(f"  当前 URL: {sb.get_current_url()}")
@@ -681,7 +659,7 @@ def main():
             '  return "text=" + el.innerText.trim() +'
             '    " disabled=" + el.disabled +'
             '    " visible=" + (r.width > 0 && r.height > 0) +'
-            '    " rect=" + JSON.stringify({t:Math.round(r.top),l:Math.round(r.left),w:Math.round(r.width),h:Math.round(r.height)});'
+            '    rect=" + JSON.stringify({t:Math.round(r.top),l:Math.round(r.left),w:Math.round(r.width),h:Math.round(r.height)});'
             '})()'
         )
         log(f"  诊断: {btn_diag}")
