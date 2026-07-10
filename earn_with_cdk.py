@@ -290,43 +290,60 @@ def dismiss_cookie_consent(sb):
     """关闭可能遮挡页面的 cookie/privacy 弹窗"""
     log("  → 检查 cookie 弹窗...")
     try:
-        # 常见的 accept/同意按钮选择器
+        # 方案1：直接用 Selenium 点 Accept 按钮
         for selector in [
-            'button:has-text("Accept")',
-            'button:has-text("Accept All")',
-            'button:has-text("I Accept")',
-            'button:has-text("同意")',
-            '#accept-cookies',
-            '.cookie-accept',
             'button.fc-cta-consent',
             'button[aria-label="Accept"]',
+            '#accept-cookies',
         ]:
             try:
-                btn = sb.find_element(selector, timeout=2)
+                btn = sb.find_element(selector, timeout=3)
                 if btn and btn.is_displayed():
                     btn.click()
-                    log(f"  ✓ 已关闭 cookie 弹窗: {selector}")
-                    time.sleep(2)
+                    log(f"  ✓ 已点击 Accept: {selector}")
+                    time.sleep(3)
                     return True
             except:
                 pass
 
-        # 兜底：用 JS 查找包含 "Accept" 文字的按钮
-        clicked = js_eval(sb,
-            '(function(){'
-            '  var btns = document.querySelectorAll("button");'
-            '  for (var b of btns) {'
-            '    if (b.offsetParent && /^\\s*accept/i.test(b.innerText.trim())) {'
-            '      b.click(); return true;'
-            '    }'
-            '  }'
-            '  return false;'
-            '})()'
-        )
-        if clicked:
-            log("  ✓ 已通过 JS 点击 Accept 按钮")
-            time.sleep(2)
-            return True
+        # 方案2：JS 找 Accept 按钮并点击
+        for _ in range(3):
+            clicked = js_eval(sb,
+                '(function(){'
+                '  var btns = document.querySelectorAll("button");'
+                '  for (var b of btns) {'
+                '    var t = b.innerText.trim().toLowerCase();'
+                '    if (b.offsetParent && (t === "accept" || t === "accept all" || t === "i accept")) {'
+                '      b.click(); return true;'
+                '    }'
+                '  }'
+                '  return false;'
+                '})()'
+            )
+            if clicked:
+                log("  ✓ 已通过 JS 点击 Accept 按钮")
+                time.sleep(3)
+                # 确认弹窗消失
+                still_there = js_eval(sb,
+                    '(function(){'
+                    '  var btns = document.querySelectorAll("button");'
+                    '  for (var b of btns) {'
+                    '    var t = b.innerText.trim().toLowerCase();'
+                    '    if (b.offsetParent && (t === "accept" || t === "accept all")) return true;'
+                    '  }'
+                    '  return false;'
+                    '})()'
+                )
+                if not still_there:
+                    return True
+                log("  ⚠️ 弹窗仍在，重试...")
+                time.sleep(2)
+            else:
+                break
+
+        # 方案3：按 Escape 关闭
+        keyboard_key("Escape")
+        time.sleep(2)
 
         log("  → 未检测到 cookie 弹窗")
     except Exception as e:
