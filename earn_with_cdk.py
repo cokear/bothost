@@ -445,6 +445,7 @@ def close_all_modals(sb):
 
 def check_button_ready(sb, max_retries=3) -> bool:
     selector = 'button.btn.green[type="submit"]'
+    safe_selector = selector.replace('"', '\\"')
     for i in range(max_retries):
         try:
             log(f"  → 检查按钮状态 ({i+1}/{max_retries})...")
@@ -452,7 +453,7 @@ def check_button_ready(sb, max_retries=3) -> bool:
             # 用 JS 直接查 DOM，绕过 Selenium 可见性检查
             btn_info = js_eval(sb,
                 f'(function(){{'
-                f'  var el = document.querySelector("{selector}");'
+                f'  var el = document.querySelector("{safe_selector}");'
                 f'  if (!el) return null;'
                 f'  return {{'
                 f'    text: el.innerText.trim(),'
@@ -479,7 +480,7 @@ def check_button_ready(sb, max_retries=3) -> bool:
                     time.sleep(3)
                     info = js_eval(sb,
                         f'(function(){{'
-                        f'  var e = document.querySelector("{selector}");'
+                        f'  var e = document.querySelector("{safe_selector}");'
                         f'  if (!e) return null;'
                         f'  return {{disabled: e.disabled, text: e.innerText.trim()}};'
                         f'}})()'
@@ -512,6 +513,7 @@ def check_button_ready(sb, max_retries=3) -> bool:
 
 def click_claim_coins(sb, max_attempts=15):
     selector       = 'button.btn.green[type="submit"]'
+    safe_selector  = selector.replace('"', '\\"')
     total_coins    = 10
     claimed_so_far = 0
     task_completed = False
@@ -533,7 +535,7 @@ def click_claim_coins(sb, max_attempts=15):
             try:
                 btn_info = js_eval(sb,
                     f'(function(){{'
-                    f'  var e = document.querySelector("{selector}");'
+                    f'  var e = document.querySelector("{safe_selector}");'
                     f'  return e ? e.innerText.trim() : "不存在";'
                     f'}})()'
                 )
@@ -551,7 +553,7 @@ def click_claim_coins(sb, max_attempts=15):
             # 用 JS 直接点击，绕过 Selenium 交互
             clicked = js_eval(sb,
                 f'(function(){{'
-                f'  var e = document.querySelector("{selector}");'
+                f'  var e = document.querySelector("{safe_selector}");'
                 f'  if (e) {{ e.click(); return true; }}'
                 f'  return false;'
                 f'}})()'
