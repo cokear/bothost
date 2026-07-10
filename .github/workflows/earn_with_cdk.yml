@@ -82,4 +82,4 @@ jobs:
           if [ -n "$PROXY_STR" ]; then
             export BROWSER_PROXY="http://127.0.0.1:8080"
           fi
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python earn_coins_dp.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python earn_with_cdk.py
