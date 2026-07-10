@@ -44,7 +44,87 @@ def send_tg(message):
         log(f"⚠️ TG 推送失败: {e}")
 
 
+def wait_for_cloudflare(sb, timeout=120):
+    """等待 Cloudflare Turnstile 验证通过（靠插件自动解）"""
+    cf_indicators = [
+        'Performing security verification',
+        'Verify you are human',
+        'Just a moment',
+        'Checking if the site connection is secure',
+    ]
+
+    log("⏳ 检查 Cloudflare 挑战...")
+    for tick in range(timeout // 3):
+        time.sleep(3)
+        url = sb.get_current_url()
+        title = sb.get_title()
+        text = js_eval(sb, 'document.body?.innerText?.substring(0, 500)') or ''
+
+        is_cf = any(kw.lower() in text.lower() for kw in cf_indicators)
+        is_cf = is_cf or any(kw.lower() in title.lower() for kw in cf_indicators)
+
+        if not is_cf:
+            log(f"✅ Cloudflare 已通过（{tick*3}s）")
+            return True
+
+        # 尝试点击 Turnstile checkbox
+        clicked = js_eval(sb,
+            '(function(){'
+            '  var frames = document.querySelectorAll("iframe[src*=\\"turnstile\\"], iframe[src*=\\"challenges.cloudflare.com\\"]");'
+            '  for (var f of frames) {'
+            '    try { f.click(); return true; } catch(e) {}'
+            '  }'
+            '  var cb = document.querySelector(".cf-turnstile input, input[type=\\"checkbox\\"]");'
+            '  if (cb) { cb.click(); return true; }'
+            '  return false;'
+            '})()'
+        )
+        if clicked:
+            log(f"  🖱️ 已尝试点击 Turnstile checkbox")
+
+        if tick % 5 == 4:
+            log(f"  ⏳ Cloudflare 验证中... {(tick+1)*3}s / {timeout}s")
+            send_tg_screenshot(sb, f"cf_waiting_{(tick+1)*3}s")
+
+    log(f"⚠️ Cloudflare 验证超时（{timeout}s）")
+    send_tg_screenshot(sb, "cf_timeout")
+    return False
+
+
 def send_tg_screenshot(sb, caption="debug"):
+    """截图并发送到 Telegram"""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        path = f"/tmp/{caption}.png"
+        sb.save_screenshot(path)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+            data={"chat_id": TG_CHAT_ID, "caption": caption},
+            files={"photo": open(path, "rb")},
+            timeout=15
+        )
+        log(f"📸 截图已推送 TG: {caption}")
+        os.remove(path)
+    except Exception as e:
+        log(f"⚠️ 截图推送失败: {e}")
+
+
+def wait_for_page_ready(sb, timeout=30):
+    """等待页面 DOM 加载完成"""
+    for _ in range(timeout // 3):
+        time.sleep(3)
+        ready = js_eval(sb,
+            '(function(){'
+            '  var btn = document.querySelector(\'button.btn.green[type="submit"]\');'
+            '  if (btn) return true;'
+            '  var form = document.querySelector(".earnBox, .form, .maintitle");'
+            '  return !!form;'
+            '})()'
+        )
+        if ready:
+            return True
+    return False
     """截图并发送到 Telegram"""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -559,8 +639,14 @@ def main():
         sb.open(TARGET_URL)
         time.sleep(5)
 
-        # 截图诊断：登录页还是面板页
-        send_tg_screenshot(sb, "panel_after_token")
+        # 等 Cloudflare Turnstile 验证通过
+        if not wait_for_cloudflare(sb, timeout=120):
+            msg = "❌ Cloudflare 验证超时，无法访问 bot-hosting"
+            log(msg)
+            send_tg(msg)
+            return
+
+        send_tg_screenshot(sb, "panel_after_cf")
         log(f"  当前 URL: {sb.get_current_url()}")
 
         log("→ 写入 localStorage token")
@@ -571,8 +657,17 @@ def main():
         sb.open(EARN_URL)
         time.sleep(5)
 
-        # 截图诊断：earn 页面加载状态
-        send_tg_screenshot(sb, "earn_page_after_token")
+        # earn 页面也可能触发 Cloudflare，再等一次
+        if not wait_for_cloudflare(sb, timeout=60):
+            msg = "❌ earn 页面 Cloudflare 验证超时"
+            log(msg)
+            send_tg(msg)
+            return
+
+        # 等页面 DOM 加载
+        wait_for_page_ready(sb, timeout=30)
+
+        send_tg_screenshot(sb, "earn_page_ready")
         log(f"  当前 URL: {sb.get_current_url()}")
 
         # 诊断按钮状态
