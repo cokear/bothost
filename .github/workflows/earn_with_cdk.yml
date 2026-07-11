@@ -33,12 +33,6 @@ jobs:
           sudo apt-get install -y xvfb xdotool
           echo "✅ 依赖安装完成"
 
-      - name: 3.5 安装 Chrome for Testing
-        uses: browser-actions/setup-chrome@v2
-        with:
-          chrome-version: stable
-        id: setup-chrome
-
       - name: 4. 还原 Chrome Profile（含 Discord 登录态 + NopeCHA key）
         uses: actions/cache/restore@v4
         with:
