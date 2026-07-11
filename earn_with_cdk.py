@@ -75,7 +75,6 @@ def send_tg_screenshot(page, caption="debug"):
 # ── Cloudflare Turnstile 处理 (CDP) ──────────────────────
 
 def _is_cf_page(page):
-    """检测当前页面是否是 Cloudflare 挑战页"""
     title = page.title or ""
     if "Just a moment" in title or "Attention Required" in title:
         return True
@@ -93,7 +92,6 @@ def _is_cf_page(page):
 
 
 def _cf_passed(page):
-    """检测 CF 是否已通过"""
     try:
         token = page.run_js("""
             var el = document.querySelector('[id$="_response"]');
@@ -114,7 +112,6 @@ def _cf_passed(page):
 
 
 def _get_cf_iframe_rect(page):
-    """用 CDP DOM pierce 定位 CF Turnstile iframe 坐标"""
     try:
         search = page.run_cdp(
             "DOM.performSearch",
@@ -166,7 +163,6 @@ def _get_cf_iframe_rect(page):
 
 
 def _cdp_click(page, vx, vy):
-    """CDP Input.dispatchMouseEvent 视口坐标点击"""
     try:
         page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved",
                      x=vx, y=vy, button="none", clickCount=0)
@@ -184,7 +180,6 @@ def _cdp_click(page, vx, vy):
 
 
 def _cf_iframe_exists(page):
-    """检查 CF Turnstile iframe 是否仍在页面中"""
     try:
         result = page.run_js("""
             return document.querySelectorAll(
@@ -197,14 +192,12 @@ def _cf_iframe_exists(page):
 
 
 def _page_has_content(page):
-    """检查页面是否加载出了实际内容（排除 CF 挑战页即可）"""
     try:
         return page.run_js("""
             var body = document.body;
             if (!body) return false;
             var text = body.innerText || '';
             var html = body.innerHTML || '';
-            // 排除 CF 挑战页的各种关键词
             var cfKeywords = [
                 'Just a moment', 'Attention Required', 'Verify you are human',
                 'Performing security verification', 'Checking if the site',
@@ -215,7 +208,6 @@ def _page_has_content(page):
                     return false;
                 }
             }
-            // 页面有实际内容就算通过
             return text.length > 50;
         """) or False
     except:
@@ -223,17 +215,14 @@ def _page_has_content(page):
 
 
 def wait_for_cloudflare(page, timeout=90):
-    """等待并通过 Cloudflare Turnstile 验证"""
     start = time.time()
     click_count = 0
 
     while time.time() - start < timeout:
-        # 已通过：无 CF iframe + 页面有实际内容
         if not _cf_iframe_exists(page) and _page_has_content(page):
             log("  ✅ Cloudflare 已通过（页面已加载）")
             return True
 
-        # 定位 CF iframe
         rect = _get_cf_iframe_rect(page)
         if rect:
             cx = int(rect["left"] + 12)
@@ -245,7 +234,6 @@ def wait_for_cloudflare(page, timeout=90):
             _cdp_click(page, cx, cy)
             click_count += 1
 
-            # 等待 CF 真正消失 + 页面加载
             for wait_i in range(20):
                 time.sleep(1)
                 iframe_gone = not _cf_iframe_exists(page)
@@ -258,7 +246,6 @@ def wait_for_cloudflare(page, timeout=90):
 
             log(f"  ⚠️ 点击后未通过，重试...")
         else:
-            # 没找到 CF iframe，但页面也没内容，继续等
             time.sleep(2)
 
     log(f"  ❌ Cloudflare 验证超时（{timeout}s）")
@@ -269,12 +256,10 @@ def wait_for_cloudflare(page, timeout=90):
 # ── Cookie 弹窗处理 ──────────────────────────────────────
 
 def dismiss_cookie_consent(page):
-    """关闭 cookie 同意弹窗"""
     log("  → 检查 cookie 弹窗...")
     try:
         time.sleep(2)
 
-        # 方案1：直接调用页面函数
         called = page.run_js("""
             try { __ncmp('save'); return true; } catch(e) { return false; }
         """)
@@ -283,7 +268,40 @@ def dismiss_cookie_consent(page):
             time.sleep(3)
             return True
 
-        # 方案2：Selenium 点击
+        try:
+            coords = page.run_js("""
+                var btns = document.querySelectorAll('button.ncmp__btn');
+                for (var b of btns) {
+                    if (b.innerText.trim() === 'Accept') {
+                        var r = b.getBoundingClientRect();
+                        return {x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)};
+                    }
+                }
+                return null;
+            """)
+            if coords:
+                wi = page.run_js("""
+                    return {
+                        sx: window.screenX || 0,
+                        sy: window.screenY || 0,
+                        oh: window.outerHeight,
+                        ih: window.innerHeight
+                    };
+                """) or {"sx": 0, "sy": 0, "oh": 1080, "ih": 900}
+                bar = wi.get("oh", 1080) - wi.get("ih", 900)
+                if bar < 0 or bar > 200:
+                    bar = 85
+                ax = coords["x"] + wi.get("sx", 0)
+                ay = coords["y"] + wi.get("sy", 0) + bar
+                os.system(f"xdotool mousemove --sync {ax} {ay}")
+                time.sleep(0.3)
+                os.system("xdotool click 1")
+                log(f"  ✓ xdotool 点击 Accept ({ax}, {ay})")
+                time.sleep(3)
+                return True
+        except Exception as e:
+            log(f"  ⚠️ xdotool 点击失败: {e}")
+
         try:
             btn = page.ele('css:button.ncmp__btn:not(.ncmp__btn-border)', timeout=3)
             if btn:
@@ -293,19 +311,6 @@ def dismiss_cookie_consent(page):
                 return True
         except:
             pass
-
-        # 方案3：JS 点击
-        clicked = page.run_js("""
-            var btns = document.querySelectorAll('button.ncmp__btn');
-            for (var b of btns) {
-                if (b.innerText.trim() === 'Accept') { b.click(); return true; }
-            }
-            return false;
-        """)
-        if clicked:
-            log("  ✓ 已通过 JS 点击 Accept")
-            time.sleep(3)
-            return True
 
         log("  → 未检测到 cookie 弹窗")
     except Exception as e:
@@ -413,7 +418,6 @@ def get_element_screen_pos(page, selector):
 
 def xdo_click(page, x, y, label=""):
     try:
-        # 获取窗口偏移
         wi = page.run_js("""
             return {
                 sx: window.screenX || 0,
@@ -560,18 +564,24 @@ def force_close_all_modals(page):
         pass
 
 
-# ── 处理弹窗并解析进度 ────────────────────────────────────
+# ── 处理弹窗并解析进度（唯一改动：用 JS 读弹窗文字）────
 
 def close_all_modals(page):
     claimed, total = None, None
     try:
         log("  → 等待成功弹窗...")
-        page.ele('css:.swal-modal', timeout=15)
+        # 等待弹窗出现
+        for _ in range(15):
+            has_modal = page.run_js("return !!document.querySelector('.swal-modal');")
+            if has_modal:
+                break
+            time.sleep(1)
         time.sleep(1.5)
 
+        # 用 JS 读取弹窗内容（比 ele().text 更可靠）
         try:
-            title = page.ele('css:.swal-title').text
-            text = page.ele('css:.swal-text').text
+            title = page.run_js("var el = document.querySelector('.swal-title'); return el ? el.innerText.trim() : '';") or ""
+            text  = page.run_js("var el = document.querySelector('.swal-text'); return el ? el.innerText.trim() : '';") or ""
             log(f"  弹窗标题: {title}")
             log(f"  弹窗内容: {text}")
             m = re.search(r'(\d+)\s*/\s*(\d+)', text)
@@ -581,29 +591,29 @@ def close_all_modals(page):
         except Exception as e:
             log(f"  ⚠️ 解析弹窗文本失败: {e}")
 
+        # 点击 OK
         try:
-            page.ele('css:button.swal-button.swal-button--confirm').click()
+            page.run_js("var btn = document.querySelector('button.swal-button.swal-button--confirm'); if(btn) btn.click();")
             log("  ✓ 已点击 OK")
             time.sleep(2)
         except:
             pass
 
-        try:
-            page.ele('css:.swal-modal', timeout=10)
-        except:
-            pass
+        # 等待弹窗消失
+        for _ in range(10):
+            still_there = page.run_js("return !!document.querySelector('.swal-modal');")
+            if not still_there:
+                break
+            time.sleep(1)
 
+        # 关闭广告弹窗
         try:
             for selector in ['div.modal-content span.close', 'span.close', '.modal-content .close']:
-                try:
-                    btn = page.ele(f'css:{selector}', timeout=2)
-                    if btn:
-                        btn.click()
-                        log("  ✓ 已关闭广告弹窗")
-                        time.sleep(2)
-                        break
-                except:
-                    pass
+                btn = page.run_js(f"var btn = document.querySelector('{selector}'); if(btn && btn.offsetParent) {{ btn.click(); return true; }} return false;")
+                if btn:
+                    log("  ✓ 已关闭广告弹窗")
+                    time.sleep(2)
+                    break
         except:
             pass
 
@@ -625,7 +635,6 @@ def check_button_ready(page, max_retries=3):
             text = btn.text.strip()
             log(f"  按钮文本: '{text}'")
 
-            # 用 JS 检查 disabled
             enabled = page.run_js(f"""
                 var el = document.querySelector('{selector}');
                 return el ? !el.disabled : false;
@@ -696,7 +705,6 @@ def click_claim_coins(page, max_attempts=15):
             continue
 
         try:
-            # JS 检查 disabled
             enabled = page.run_js(f"""
                 var el = document.querySelector('{selector}');
                 return el ? !el.disabled : false;
@@ -761,7 +769,6 @@ def main():
 
     # 加载 NopeCHA 扩展
     if os.path.isdir(NOPECHA_EXT_DIR):
-        # DrissionPage 用 add_extension 加载扩展目录
         co.add_extension(NOPECHA_EXT_DIR)
         log(f"📦 加载扩展: {NOPECHA_EXT_DIR}")
     else:
@@ -777,21 +784,6 @@ def main():
     except Exception as e:
         log(f"❌ 浏览器启动失败: {e}")
         return
-
-    # 检查扩展是否真的加载了
-    log("→ 检查浏览器扩展加载状态...")
-    try:
-        # 打开一个空白页来检查
-        page.get("chrome://extensions/")
-        time.sleep(3)
-        ext_html = page.run_js("return document.body.innerText;") or ""
-        if "nopecha" in ext_html.lower():
-            log("  ✅ NopeCHA 扩展已加载")
-        else:
-            log(f"  ⚠️ 未在扩展页面找到 NopeCHA")
-            log(f"  扩展页面内容: {ext_html[:200]}")
-    except Exception as e:
-        log(f"  ⚠️ 检查扩展状态失败: {e}")
 
     try:
         # ── Step 1: 确保 CDK 有效并注入 ──────────────────
@@ -818,38 +810,32 @@ def main():
         send_tg_screenshot(page, "panel_ready")
         log(f"  当前 URL: {page.url}")
 
-        # 写入 token — 先在当前页面写，确保域名正确
+        # 写入 token
         log("→ 写入 localStorage token")
         current_url = page.url or ''
         log(f"  当前 URL: {current_url}")
 
-        # 确保在 bot-hosting 域名下
         if 'bot-hosting.net' not in current_url:
             page.get(TARGET_URL)
             time.sleep(3)
             if _is_cf_page(page):
                 wait_for_cloudflare(page, timeout=60)
 
-        # 写入 token
         page.run_js(f"localStorage.setItem('token', '{TOKEN}')")
         log("  ✓ token 已写入 localStorage")
 
-        # 同时写入 cookie 作为备份
         page.run_js(f"""
             document.cookie = 'token={TOKEN}; path=/; domain=.bot-hosting.net; max-age=86400';
         """)
         log("  ✓ token 已写入 cookie")
 
-        # 验证写入成功
         verify = page.run_js("return localStorage.getItem('token');")
         log(f"  验证 localStorage: {'✅ 已写入' if verify else '❌ 为空'}")
 
-        # 刷新让 token 生效
         log("  → 刷新页面...")
         page.refresh()
         time.sleep(5)
 
-        # 检查登录状态
         after_url = page.url or ''
         log(f"  刷新后 URL: {after_url}")
         if '/login' in after_url:
@@ -859,12 +845,10 @@ def main():
             if _is_cf_page(page):
                 wait_for_cloudflare(page, timeout=60)
 
-        # 跳转到 earn
         log(f"→ 跳转到 {EARN_URL}")
         page.get(EARN_URL)
         time.sleep(5)
 
-        # earn 页面也可能有 Cloudflare
         if _is_cf_page(page):
             log("  ⚡ earn 页面 Cloudflare...")
             wait_for_cloudflare(page, timeout=60)
