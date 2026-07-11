@@ -2,7 +2,7 @@ name: 🔑🪙 Bot-Hosting 自动续期 (纯 OAuth)
 
 on:
   repository_dispatch:
-    types: [new]
+    types: [newbot]
   workflow_dispatch:
 
 concurrency:
