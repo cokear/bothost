@@ -512,27 +512,103 @@ def read_dm_cdk(page, load_timeout=30):
     return last_cdk, False, True
 
 
+# ── 等频道输入框（slate editor）真正可交互 ────────────────
+
+def wait_channel_input_ready(page, timeout=30):
+    """轮询直到频道消息输入框存在且有可见尺寸。返回 True/False。"""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            ok = page.run_js("""
+                var ed = document.querySelector('[data-slate-editor="true"]');
+                if (!ed) return false;
+                var r = ed.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            """)
+            if ok:
+                return True
+        except:
+            pass
+        time.sleep(1)
+    return False
+
+
+# ── 输入并验证命令确实发出去了 ────────────────────────────
+
+def type_command_verified(page, cmd="!nopecha", retries=3):
+    """
+    点击输入框 → 清空 → 输入命令 → 校验输入框确有命令文本 → 回车
+    → 校验回车后输入框已清空（= 已发送）。任一步失败则重试。
+    """
+    for i in range(retries):
+        log(f"  → 输入命令尝试 {i+1}/{retries}...")
+
+        ix, iy = get_element_screen_pos(page, '[data-slate-editor="true"]')
+        if not ix:
+            log("  ⚠️ 输入框坐标获取失败，等待后重试...")
+            time.sleep(2)
+            continue
+
+        xdo_click(page, ix, iy, "输入框")
+        time.sleep(random.uniform(0.6, 1.2))
+
+        # 清空可能的残留
+        keyboard_key("ctrl+a")
+        time.sleep(0.2)
+        keyboard_key("Delete")
+        time.sleep(0.2)
+
+        keyboard_type(cmd)
+        time.sleep(random.uniform(0.5, 0.9))
+
+        # 校验：输入框里确实有命令文本，否则说明焦点没进去/页面没就绪
+        cur = page.run_js("""
+            var ed = document.querySelector('[data-slate-editor="true"]');
+            return ed ? (ed.innerText || '').trim() : '';
+        """) or ''
+        log(f"  当前输入框内容: '{cur}'")
+
+        if cmd.strip() not in cur:
+            log("  ⚠️ 输入框未获取到命令文本（焦点/加载问题），重试...")
+            time.sleep(2)
+            continue
+
+        keyboard_key("Return")
+        time.sleep(1.5)
+
+        # 校验：回车后输入框应清空 = 已成功发送
+        after = page.run_js("""
+            var ed = document.querySelector('[data-slate-editor="true"]');
+            return ed ? (ed.innerText || '').trim() : '';
+        """) or ''
+
+        if cmd.strip() not in after:
+            log("  ✅ 命令已成功发送（输入框已清空）")
+            return True
+
+        log("  ⚠️ 回车后输入框仍有内容，可能未发送，重试...")
+        time.sleep(2)
+
+    return False
+
+
 # ── 发送命令并轮询 CDK ────────────────────────────────────
 
 def send_command_and_poll(page):
     page.get(DISCORD_CHANNEL_URL)
-    wait_dm_rendered(page, timeout=25)
 
-    log("🖱️ 定位消息输入框...")
-    ix, iy = get_element_screen_pos(page, '[data-slate-editor="true"]')
-    if not ix:
-        log("❌ 找不到 Discord 输入框")
+    # 关键修复：先等频道输入框真正就绪，页面没加载好绝不敲命令
+    log("⏳ 等待频道输入框就绪...")
+    if not wait_channel_input_ready(page, timeout=30):
+        log("❌ 频道输入框超时未就绪（页面没加载好），本轮放弃发送")
         return ''
+    # 再确认消息区渲染，避免 slash-command 面板等干扰
+    wait_dm_rendered(page, timeout=15)
 
-    xdo_click(page, ix, iy, "输入框")
-    time.sleep(random.uniform(0.5, 1.0))
-
-    log("⌨️ 输入 !nopecha...")
-    keyboard_key("ctrl+a")
-    time.sleep(0.2)
-    keyboard_type("!nopecha")
-    time.sleep(random.uniform(0.4, 0.8))
-    keyboard_key("Return")
+    log("⌨️ 发送 !nopecha 命令（带验证）...")
+    if not type_command_verified(page, "!nopecha", retries=3):
+        log("❌ !nopecha 命令发送失败（输入框/页面未就绪）")
+        return ''
 
     log("✅ 命令已发送，等待私聊回复...")
     time.sleep(5)
