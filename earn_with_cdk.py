@@ -453,11 +453,70 @@ def keyboard_key(key):
     time.sleep(0.1)
 
 
+# ── 等 Discord 消息区真正渲染出来（内容驱动，抗慢网）──────
+
+def wait_dm_rendered(page, timeout=25):
+    """
+    轮询直到聊天消息节点出现且正文有一定长度。
+    返回 True 表示消息区确实渲染完成；False 表示超时内未加载出来。
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            ready = page.run_js("""
+                return !!document.querySelector(
+                    '[data-list-id="chat-messages"] li,'
+                    + 'li[id^="chat-messages"],'
+                    + '[class*="messageListItem"],'
+                    + '[class*="messageContent"]'
+                );
+            """)
+            if ready:
+                txt_len = page.run_js("return (document.body.innerText || '').length;") or 0
+                if txt_len > 80:
+                    return True
+        except:
+            pass
+        time.sleep(1)
+    return False
+
+
+# ── 打开私聊并轮询读取 CDK（区分「没加载」与「没有CDK」）──────
+
+def read_dm_cdk(page, load_timeout=30):
+    """
+    打开 Discord 私聊并稳健读取 CDK。
+    返回 (cdk, is_recent, rendered):
+      - rendered=True  表示消息区确实渲染完成（可信地判断有无 CDK）
+      - rendered=False 表示超时内页面没加载完（网络慢，不应据此判定"没有 CDK"）
+    """
+    page.get(DISCORD_DM_URL)
+
+    rendered = wait_dm_rendered(page, timeout=load_timeout)
+    if not rendered:
+        log("  ⚠️ 私聊消息区在超时内未渲染完成（可能网络慢）")
+        return '', False, False
+
+    # 已渲染，但懒加载可能还差最后一帧 → 多读几轮取稳定结果
+    last_cdk = ''
+    for _ in range(3):
+        text = get_page_text(page)
+        cdk, is_recent = extract_latest_cdk(text) if text else ('', False)
+        if cdk and is_recent:
+            return cdk, True, True
+        if cdk:
+            last_cdk = cdk
+        time.sleep(1.5)
+
+    # 消息区已渲染完成但没有 24h 内的 CDK → 确实没有
+    return last_cdk, False, True
+
+
 # ── 发送命令并轮询 CDK ────────────────────────────────────
 
 def send_command_and_poll(page):
     page.get(DISCORD_CHANNEL_URL)
-    time.sleep(3)
+    wait_dm_rendered(page, timeout=25)
 
     log("🖱️ 定位消息输入框...")
     ix, iy = get_element_screen_pos(page, '[data-slate-editor="true"]')
@@ -479,21 +538,20 @@ def send_command_and_poll(page):
     time.sleep(5)
 
     for attempt in range(20):
-        time.sleep(3)
-        log(f"  [{attempt*3+3}s] 打开私聊检查...")
+        log(f"  [{attempt+1}/20] 打开私聊检查新 CDK...")
 
-        page.get(DISCORD_DM_URL)
-        time.sleep(5)
+        # 内容驱动读取：慢网会等到真正渲染完再判断
+        cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=30)
+        if cdk and is_recent:
+            log(f"✅ 提取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
+            return cdk
 
-        page_text = get_page_text(page)
-        if page_text:
-            cdk, is_recent = extract_latest_cdk(page_text)
-            if cdk and is_recent:
-                log(f"✅ 提取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
-                return cdk
+        if not rendered:
+            log("  ⏳ 私聊未加载完成，稍后重试（不判定为无 CDK）...")
 
+        # 未拿到有效 CDK → 回频道等 bot 私聊回复
         page.get(DISCORD_CHANNEL_URL)
-        time.sleep(2)
+        time.sleep(4)
 
     return ''
 
@@ -512,16 +570,24 @@ def ensure_cdk(page):
         return ''
 
     log("🔍 检查私聊是否已有24h内的 CDK...")
-    page.get(DISCORD_DM_URL)
-    time.sleep(5)
-
-    page_text = get_page_text(page)
-    cdk, is_recent = extract_latest_cdk(page_text) if page_text else ('', False)
+    cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=40)
 
     if cdk and is_recent:
         log(f"✅ 已有24h内的 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
         inject_nopecha_key(page, cdk)
         return cdk
+
+    # 关键修复：私聊没加载完时不要立刻当成"没有 CDK"去重发命令，先重试读取
+    if not rendered:
+        for i in range(2):
+            log(f"  🔁 私聊未加载完成，重试读取 ({i+1}/2)...")
+            cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=40)
+            if cdk and is_recent:
+                log(f"✅ 重试读到24h内 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
+                inject_nopecha_key(page, cdk)
+                return cdk
+            if rendered:
+                break
 
     log("📭 无24h内的 CDK，去频道发送命令领取新的...")
     cdk = send_command_and_poll(page)
