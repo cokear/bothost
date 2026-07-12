@@ -537,50 +537,76 @@ def wait_channel_input_ready(page, timeout=30):
 
 def type_command_verified(page, cmd="!nopecha", retries=3):
     """
-    点击输入框 → 清空 → 输入命令 → 校验输入框确有命令文本 → 回车
+    聚焦输入框 → CDP 注入文本 → 校验输入框确有命令 → CDP 回车
     → 校验回车后输入框已清空（= 已发送）。任一步失败则重试。
+
+    注意：不再用 get_element_screen_pos + xdotool（屏幕坐标会重复叠加
+    标题栏偏移，导致点击落在输入框下方、焦点进不去）。改用 CDP，
+    完全绕开坐标误差。
     """
+    sel = '[data-slate-editor="true"]'
     for i in range(retries):
         log(f"  → 输入命令尝试 {i+1}/{retries}...")
 
-        ix, iy = get_element_screen_pos(page, '[data-slate-editor="true"]')
-        if not ix:
-            log("  ⚠️ 输入框坐标获取失败，等待后重试...")
+        # 1) 聚焦输入框：DrissionPage 原生点击（CDP，viewport 坐标，可靠）+ JS focus 兜底
+        try:
+            ed = page.ele(f'css:{sel}', timeout=10)
+            ed.click()
+        except Exception as e:
+            log(f"  ⚠️ 定位/点击输入框失败: {e}")
             time.sleep(2)
             continue
+        page.run_js("var ed=document.querySelector('%s'); if(ed) ed.focus();" % sel)
+        time.sleep(0.5)
 
-        xdo_click(page, ix, iy, "输入框")
-        time.sleep(random.uniform(0.6, 1.2))
+        # 2) 清空残留
+        try:
+            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="a",
+                         code="KeyA", modifiers=2)  # Ctrl+A
+            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="a",
+                         code="KeyA", modifiers=2)
+            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Delete",
+                         code="Delete", windowsVirtualKeyCode=46, nativeVirtualKeyCode=46)
+            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Delete",
+                         code="Delete", windowsVirtualKeyCode=46, nativeVirtualKeyCode=46)
+        except:
+            pass
+        time.sleep(0.3)
 
-        # 清空可能的残留
-        keyboard_key("ctrl+a")
-        time.sleep(0.2)
-        keyboard_key("Delete")
-        time.sleep(0.2)
-
-        keyboard_type(cmd)
+        # 3) CDP 注入文本（插入到当前聚焦的可编辑元素，触发 input 事件）
+        try:
+            page.run_cdp("Input.insertText", text=cmd)
+        except Exception as e:
+            log(f"  ⚠️ insertText 失败，尝试键盘输入兜底: {e}")
+            keyboard_type(cmd)
         time.sleep(random.uniform(0.5, 0.9))
 
-        # 校验：输入框里确实有命令文本，否则说明焦点没进去/页面没就绪
-        cur = page.run_js("""
-            var ed = document.querySelector('[data-slate-editor="true"]');
-            return ed ? (ed.innerText || '').trim() : '';
-        """) or ''
+        # 4) 校验：输入框里确实有命令文本
+        cur = page.run_js(
+            "var ed=document.querySelector('%s'); return ed ? (ed.innerText||'').trim() : '';" % sel
+        ) or ''
         log(f"  当前输入框内容: '{cur}'")
 
         if cmd.strip() not in cur:
-            log("  ⚠️ 输入框未获取到命令文本（焦点/加载问题），重试...")
+            log("  ⚠️ 输入框仍未获取到命令文本，重试...")
             time.sleep(2)
             continue
 
-        keyboard_key("Return")
+        # 5) CDP 回车发送
+        try:
+            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Enter",
+                         code="Enter", windowsVirtualKeyCode=13, nativeVirtualKeyCode=13, text="\r")
+            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Enter",
+                         code="Enter", windowsVirtualKeyCode=13, nativeVirtualKeyCode=13)
+        except Exception as e:
+            log(f"  ⚠️ CDP 回车失败，尝试键盘兜底: {e}")
+            keyboard_key("Return")
         time.sleep(1.5)
 
-        # 校验：回车后输入框应清空 = 已成功发送
-        after = page.run_js("""
-            var ed = document.querySelector('[data-slate-editor="true"]');
-            return ed ? (ed.innerText || '').trim() : '';
-        """) or ''
+        # 6) 校验：回车后输入框应清空 = 已成功发送
+        after = page.run_js(
+            "var ed=document.querySelector('%s'); return ed ? (ed.innerText||'').trim() : '';" % sel
+        ) or ''
 
         if cmd.strip() not in after:
             log("  ✅ 命令已成功发送（输入框已清空）")
