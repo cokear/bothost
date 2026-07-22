@@ -1,0 +1,156 @@
+name: 🛠️ 调试 DrissionPage Chrome Profile（noVNC 远程）
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait_minutes:
+        description: '远程操作等待时长（分钟，默认 15）'
+        required: false
+        default: '15'
+
+concurrency:
+  group: discord-profile-debug-dp
+  cancel-in-progress: true
+
+jobs:
+  debug-profile:
+    name: 🛠️ DrissionPage 远程调试
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U DrissionPage requests
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb x11vnc xdotool fluxbox novnc websockify
+          echo "✅ 依赖安装完成"
+
+      - name: 4. 恢复 Chrome Profile 缓存
+        id: restore-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1-${{ github.run_id }}
+          restore-keys: |
+            chrome-profile-discord-v1-
+
+      - name: 5. 检查 Profile 和插件目录
+        run: |
+          if [ -d "$HOME/.chrome-profile-discord" ]; then
+            echo "✅ Chrome Profile 已恢复"
+            du -sh ~/.chrome-profile-discord
+          else
+            echo "⚠️ Chrome Profile 不存在，将创建新的"
+          fi
+          if [ -d "$GITHUB_WORKSPACE/chromium" ]; then
+            echo "✅ NopeCHA 插件目录存在"
+            ls -la "$GITHUB_WORKSPACE/chromium/"
+          else
+            echo "❌ chromium/ 目录不存在"
+            exit 1
+          fi
+
+      - name: 6. 清理锁文件
+        run: |
+          rm -f ~/.chrome-profile-discord/SingletonLock
+          rm -f ~/.chrome-profile-discord/SingletonSocket
+          rm -f ~/.chrome-profile-discord/SingletonCookie
+          echo "✅ 锁文件已清理"
+
+      - name: 7. 按需拉起代理（Sing-Box）
+        if: env.PROXY_STR != ''
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+        run: |
+          echo "✅ 检测到代理配置，正在拉起 Sing-Box..."
+          curl -LO https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
+          tar -xzf sing-box-1.9.3-linux-amd64.tar.gz
+          sudo cp sing-box-1.9.3-linux-amd64/sing-box /usr/local/bin/
+          python convert_proxy.py
+          nohup sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 3
+          curl -sS --socks5 127.0.0.1:8080 \
+            -o /dev/null -w "代理状态: %{http_code}\n" \
+            https://api.ipify.org || echo "⚠️ 代理可能未就绪"
+
+      - name: 8. 启动 DrissionPage 浏览器 + noVNC
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+          WAIT_MINUTES: ${{ github.event.inputs.wait_minutes }}
+        run: |
+          # 启动虚拟屏幕
+          Xvfb :99 -screen 0 1280x800x24 &
+          export DISPLAY=:99
+          sleep 1
+
+          # 启动窗口管理器
+          fluxbox &
+          sleep 1
+
+          # 启动 VNC
+          x11vnc -display :99 -forever -nopw -rfbport 5900 -shared -o /tmp/x11vnc.log &
+          sleep 2
+
+          # 启动 noVNC
+          websockify --web /usr/share/novnc 6080 localhost:5900 &
+          sleep 2
+
+          # 配置代理环境变量
+          if [ -n "$PROXY_STR" ]; then
+            export BROWSER_PROXY="http://127.0.0.1:8080"
+          fi
+
+          # 启动 DrissionPage 浏览器（后台运行）
+          python "$GITHUB_WORKSPACE/start_browser.py" &
+          BROWSER_PID=$!
+          echo "✅ DrissionPage 浏览器已启动 (pid=$BROWSER_PID)"
+
+          # 等待浏览器启动
+          sleep 10
+
+          # 启动 cloudflared 临时隧道
+          curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+          nohup cloudflared tunnel --url http://localhost:6080 > /tmp/cf.log 2>&1 &
+          sleep 8
+
+          # 提取访问链接
+          CF_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
+          if [ -z "$CF_URL" ]; then
+            echo "❌ 未获取到 trycloudflare 链接"
+            tail -200 /tmp/cf.log || true
+            exit 1
+          fi
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  🌐 浏览器打开下面的链接远程操控 Chrome                     ║"
+          echo "║                                                              ║"
+          echo "║  👉 ${CF_URL}/vnc.html?autoconnect=true&reconnect=true"
+          echo "║                                                              ║"
+          echo "║  浏览器已打开 chrome://extensions/                           ║"
+          echo "║  请检查 NopeCHA 插件是否加载成功                            ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          # 等待浏览器进程结束
+          wait $BROWSER_PID || true
+
+      - name: 9. 保存 Chrome Profile
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1-${{ github.run_id }}
+
+      - name: 10. 完成
+        run: echo "✅ 调试结束，Chrome Profile 已保存"
