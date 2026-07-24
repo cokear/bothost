@@ -1,1070 +1,899 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Bot-Hosting 金币自动领取 (DrissionPage 版)
-- Discord 获取 NopeCHA CDK → 注入插件
-- Bot-Hosting 自动领取金币
-- Cloudflare Turnstile 自动处理 (CDP)
-"""
-
-import time
+import json
 import os
 import re
-import random
-import requests
-from DrissionPage import ChromiumPage, ChromiumOptions
+import subprocess
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
 
-# ================= 配置区域 =================
-PROXY_URL       = os.getenv("BROWSER_PROXY", "")
-PROFILE_DIR     = os.getenv("BROWSER_USER_DATA_DIR",
-                            os.path.expanduser("~/.chrome-profile-discord"))
-NOPECHA_EXT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium")
-
-DISCORD_CHANNEL_URL = "https://discord.com/channels/1046086326077882479/1243188924520726538"
-DISCORD_DM_URL      = "https://discord.com/channels/@me/1514785932203528202"
-
-TARGET_URL = "https://legacy.bot-hosting.net/panel/"
-EARN_URL   = "https://legacy.bot-hosting.net/panel/earn"
-TOKEN      = os.getenv("TOKEN")
-
-TG_TOKEN   = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-
-IS_CI   = os.getenv("CI") == "true"
-# ===========================================
+from seleniumbase import SB
 
 
-# ── 日志 & 通知 ───────────────────────────────────────────
+USER_ENV_FILE = str(Path.home() / ".config" / "browser-automation-panel" / "scripts.env")
+TASK_RESULT_PATH = (os.environ.get("TASK_RESULT_PATH") or "").strip()
+TASK_SCREENSHOT_PATH = (os.environ.get("TASK_SCREENSHOT_PATH") or "").strip()
+SCRIPT_REVISION = "2026-07-24-github-auto-login"
 
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+SITE_URL = "https://agentrouter.org"
+LOGIN_URL = "https://agentrouter.org/login"
+WALLET_URL = "https://agentrouter.org/console/topup"
+LOGIN_TEXT = "使用 GitHub 继续"
+WAIT_AFTER_CLICK = 90.0
+READY_WAIT = 2.0
+USE_UC = False
+TG_CHAT_ID = ""
+TG_TOKEN = ""
+TG_PROXY = ""
+GH_USERNAME = ""
+GH_PASSWORD = ""
 
 
-def send_tg(message):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
+def log(message: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def load_env_file(env_file_path: str) -> bool:
+    path = Path(env_file_path)
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": TG_CHAT_ID, "text": message},
-            timeout=10
-        )
-    except Exception as e:
-        log(f"⚠️ TG 推送失败: {e}")
-
-
-def send_tg_screenshot(page, caption="debug"):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    try:
-        path = f"/tmp/{caption}.png"
-        page.get_screenshot(path=path)
-        with open(path, 'rb') as f:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-                data={"chat_id": TG_CHAT_ID, "caption": caption},
-                files={"photo": f},
-                timeout=15
-            )
-        log(f"📸 截图已推送 TG: {caption}")
-        os.remove(path)
-    except Exception as e:
-        log(f"⚠️ 截图推送失败: {e}")
-
-
-# ── Cloudflare Turnstile 处理 (CDP) ──────────────────────
-
-def _is_cf_page(page):
-    title = page.title or ""
-    if "Just a moment" in title or "Attention Required" in title:
-        return True
-    try:
-        return bool(page.run_js("""
-            return !!(
-                document.getElementById('VXzI4') ||
-                document.querySelector('[id^="cf-chl-widget"]') ||
-                document.querySelector('h2#kxxo4') ||
-                document.querySelector('.cf-turnstile')
-            );
-        """))
-    except:
+        if not path.exists():
+            log(f"env file not found: {env_file_path}")
+            return False
+        loaded_any = False
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+                loaded_any = True
+        log(f"env file loaded: {env_file_path}")
+        return loaded_any
+    except Exception as exc:
+        log(f"env file load failed: {env_file_path}: {exc}")
         return False
 
 
-def _cf_passed(page):
+def refresh_config() -> None:
+    global SITE_URL, LOGIN_URL, WALLET_URL, LOGIN_TEXT, WAIT_AFTER_CLICK, READY_WAIT, USE_UC
+    global TG_CHAT_ID, TG_TOKEN, TG_PROXY, GH_USERNAME, GH_PASSWORD
+
+    SITE_URL = (os.environ.get("AGENTROUTER_SITE_URL") or "https://agentrouter.org").strip().rstrip("/")
+    LOGIN_URL = (os.environ.get("AGENTROUTER_LOGIN_URL") or f"{SITE_URL}/login").strip()
+    WALLET_URL = (os.environ.get("AGENTROUTER_WALLET_URL") or f"{SITE_URL}/console/topup").strip()
+    LOGIN_TEXT = (os.environ.get("AGENTROUTER_LOGIN_TEXT") or "使用 GitHub 继续").strip()
+    WAIT_AFTER_CLICK = float((os.environ.get("AGENTROUTER_WAIT_AFTER_CLICK") or "90").strip() or "90")
+    READY_WAIT = float((os.environ.get("AGENTROUTER_READY_WAIT") or "2").strip() or "2")
+    USE_UC = (os.environ.get("AGENTROUTER_USE_UC") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    TG_CHAT_ID = (os.environ.get("TG_CHAT_ID") or os.environ.get("CHAT_ID") or "").strip()
+    TG_TOKEN = (
+        os.environ.get("TG_BOT_TOKEN")
+        or os.environ.get("TG_TOKEN")
+        or os.environ.get("BOT_TOKEN")
+        or ""
+    ).strip()
+    TG_PROXY = (
+        os.environ.get("TG_PROXY")
+        or os.environ.get("TG_PROXY_URL")
+        or os.environ.get("ALL_PROXY")
+        or os.environ.get("all_proxy")
+        or ""
+    ).strip()
+    GH_USERNAME = (os.environ.get("GH_USERNAME") or "").strip()
+    GH_PASSWORD = (os.environ.get("GH_PASSWORD") or "").strip()
+
+
+def host_from_url(url: str) -> str:
+    return urlparse(url or "").netloc.lower()
+
+
+def path_from_url(url: str) -> str:
+    path = urlparse(url or "").path.rstrip("/")
+    return path or "/"
+
+
+def is_target_host(url: str) -> bool:
+    host = host_from_url(url)
+    target_host = host_from_url(SITE_URL)
+    return bool(host and target_host and (host == target_host or host.endswith("." + target_host)))
+
+
+def current_url_safe(sb: SB) -> str:
     try:
-        token = page.run_js("""
-            var el = document.querySelector('[id$="_response"]');
-            return el ? el.value : '';
-        """)
-        if token:
+        return sb.get_current_url() or ""
+    except Exception as exc:
+        return f"<unavailable: {exc}>"
+
+
+def normalize_socks_proxy(proxy: str) -> str:
+    value = (proxy or "").strip()
+    for prefix in ("socks5h://", "socks5://", "http://", "https://"):
+        if value.lower().startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+
+def send_tg_message_via_curl(text: str) -> bool:
+    if not TG_PROXY:
+        return False
+    proxy = normalize_socks_proxy(TG_PROXY)
+    if not proxy:
+        return False
+    cmd = [
+        "curl", "-sS", "--max-time", "25",
+        "--socks5-hostname", proxy,
+        "-X", "POST",
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        "--data-urlencode", f"chat_id={TG_CHAT_ID}",
+        "--data-urlencode", f"text={text}",
+        "--data-urlencode", "disable_web_page_preview=true",
+    ]
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
+        body = (proc.stdout or "").strip()
+        if '"ok":true' in body.replace(" ", ""):
+            log(f"TG text push sent via curl+socks ({proxy})")
             return True
-    except:
-        pass
-    title = page.title or ""
-    if "Just a moment" not in title and "Attention Required" not in title:
-        try:
-            if not _is_cf_page(page):
-                return True
-        except:
-            return True
+        log(f"TG curl response not ok: {body[:220]}")
+    except Exception as exc:
+        log(f"TG curl push failed: {exc}")
     return False
 
 
-def _get_cf_iframe_rect(page):
+def send_tg_message(text: str) -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        log("TG not configured, skipping text push")
+        return
+    message = (text or "").strip()
+    if not message:
+        return
+    if send_tg_message_via_curl(message):
+        return
     try:
-        search = page.run_cdp(
-            "DOM.performSearch",
-            query="iframe[src*='challenges.cloudflare.com']",
-            includeUserAgentShadowDOM=True
-        )
-        sid = search.get("searchId")
-        cnt = search.get("resultCount", 0)
-
-        if cnt > 0 and sid:
-            results = page.run_cdp(
-                "DOM.getSearchResults",
-                searchId=sid, fromIndex=0, toIndex=cnt
-            )
-            for nid in results.get("nodeIds", []):
-                try:
-                    obj = page.run_cdp("DOM.resolveNode", nodeId=nid)
-                    oid = obj["object"]["objectId"]
-                    rr = page.run_cdp(
-                        "Runtime.callFunctionOn",
-                        objectId=oid,
-                        functionDeclaration="""
-                        function() {
-                            var r = this.getBoundingClientRect();
-                            return {
-                                left: r.left, top: r.top,
-                                width: r.width, height: r.height
-                            };
-                        }
-                        """,
-                        returnByValue=True
-                    )
-                    rv = rr.get("result", {}).get("value", {})
-                    if rv.get("width", 0) > 20 and rv.get("height", 0) > 20:
-                        try:
-                            page.run_cdp("DOM.discardSearchResults", searchId=sid)
-                        except:
-                            pass
-                        return rv
-                except:
-                    continue
-            try:
-                page.run_cdp("DOM.discardSearchResults", searchId=sid)
-            except:
-                pass
-    except Exception as e:
-        log(f"  ⚠️ CF iframe 定位失败: {e}")
-    return None
-
-
-def _cdp_click(page, vx, vy):
-    try:
-        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved",
-                     x=vx, y=vy, button="none", clickCount=0)
-        time.sleep(0.05)
-        page.run_cdp("Input.dispatchMouseEvent", type="mousePressed",
-                     x=vx, y=vy, button="left", clickCount=1)
-        time.sleep(0.05)
-        page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
-                     x=vx, y=vy, button="left", clickCount=1)
-        log(f"  🖱️ CDP 点击: ({vx}, {vy})")
-        return True
-    except Exception as e:
-        log(f"  ⚠️ CDP 点击失败: {e}")
-        return False
-
-
-def _cf_iframe_exists(page):
-    try:
-        result = page.run_js("""
-            return document.querySelectorAll(
-                'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"]'
-            ).length;
-        """)
-        return result and result > 0
-    except:
-        return False
-
-
-def _page_has_content(page):
-    try:
-        return page.run_js("""
-            var body = document.body;
-            if (!body) return false;
-            var text = body.innerText || '';
-            var html = body.innerHTML || '';
-            var cfKeywords = [
-                'Just a moment', 'Attention Required', 'Verify you are human',
-                'Performing security verification', 'Checking if the site',
-                'challenge-platform', 'cf-chl-widget', 'cf-turnstile'
-            ];
-            for (var i = 0; i < cfKeywords.length; i++) {
-                if (text.indexOf(cfKeywords[i]) !== -1 || html.indexOf(cfKeywords[i]) !== -1) {
-                    return false;
-                }
+        payload = urllib.parse.urlencode(
+            {
+                "chat_id": TG_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": "true",
             }
-            return text.length > 50;
-        """) or False
-    except:
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+        log("TG text push sent")
+    except Exception as exc:
+        log(f"TG text push failed: {exc}")
+
+
+def get_tg_updates_via_curl(offset=None) -> dict:
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?timeout=5"
+    if offset:
+        url += f"&offset={offset}"
+    cmd = ["curl", "-sS", "--max-time", "15"]
+    proxy = normalize_socks_proxy(TG_PROXY)
+    if proxy and TG_PROXY.startswith("socks"):
+        cmd += ["--socks5-hostname", proxy]
+    elif proxy:
+        cmd += ["-x", proxy]
+    cmd.append(url)
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
+        return json.loads(proc.stdout)
+    except Exception:
+        return {}
+
+
+def tg_wait_code(timeout: int = 90) -> str:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        log("TG not configured for 2FA code retrieval")
+        return ""
+    log(f"等待 TG 两步验证码（{timeout}s）...")
+    offset = None
+    data = get_tg_updates_via_curl()
+    if data.get("ok") and data.get("result"):
+        offset = data["result"][-1]["update_id"] + 1
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = get_tg_updates_via_curl(offset)
+        if data.get("ok") and data.get("result"):
+            for upd in data["result"]:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                if str(msg.get("chat", {}).get("id")) == str(TG_CHAT_ID):
+                    m = re.search(r"\b(\d{6})\b", (msg.get("text") or "").strip())
+                    if m:
+                        return m.group(1)
+        time.sleep(2)
+    return ""
+
+
+def build_tg_card(ok: bool, data: dict | None = None, error: str = "") -> str:
+    data = data or {}
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status = "✅ 成功" if ok else "❌ 失败"
+    lines = [
+        "🤖 AgentRouter 签到通知",
+        "",
+        f"🕒 运行时间: {now_str}",
+        f"📊 结果: {status}",
+        f"💰 签到前余额: {data.get('balanceBeforeText') or '未读取'}",
+        f"💵 签到后余额: {data.get('balanceAfterText') or '未读取'}",
+        f"📈 余额变动: {data.get('balanceDeltaText') or '未读取'}",
+        f"🧪 判定依据: {data.get('reason') or ('OK' if ok else 'FAILED')}",
+    ]
+    if data.get("url"):
+        lines.append(f"🔗 最终页面: {data['url']}")
+    if error:
+        lines.append(f"⚠️ 异常: {error[:240]}")
+    return "\n".join(lines)
+
+
+def write_result(ok: bool, error: str | None = None, data: dict | None = None, screenshot_path: str | None = None) -> None:
+    if not TASK_RESULT_PATH:
+        return
+    payload = {
+        "ok": ok,
+        "screenshotPath": screenshot_path or TASK_SCREENSHOT_PATH or None,
+        "data": data or {},
+    }
+    if error:
+        payload["error"] = error
+    path = Path(TASK_RESULT_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_screenshot(sb: SB, path: str | None = None) -> str | None:
+    shot = path or TASK_SCREENSHOT_PATH
+    if not shot:
+        return None
+    try:
+        p = Path(shot)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        sb.save_screenshot(str(p))
+        return str(p)
+    except Exception as exc:
+        log(f"screenshot failed: {exc}")
+        return None
+
+
+def normalize_sb_proxy(proxy: str) -> str:
+    value = proxy.strip()
+    for prefix in ("socks5h://", "socks5://", "https://", "http://"):
+        if value.lower().startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+
+def build_sb_args() -> dict:
+    chrome_path = (os.environ.get("BROWSER_CHROME_PATH") or "").strip()
+    user_data_dir = (os.environ.get("BROWSER_USER_DATA_DIR") or "").strip()
+    proxy = (os.environ.get("BROWSER_PROXY") or "").strip()
+    locale = (os.environ.get("BROWSER_LOCALE") or "").strip()
+
+    args = {"test": True, "headed": True}
+    if USE_UC:
+        args["uc"] = True
+    if chrome_path:
+        args["binary_location"] = chrome_path
+    if user_data_dir:
+        args["user_data_dir"] = user_data_dir
+    if proxy:
+        args["proxy"] = normalize_sb_proxy(proxy)
+
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--hide-crash-restore-bubble",
+        "--disable-session-crashed-bubble",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if proxy:
+        chromium_args.append(f"--proxy-server={proxy}")
+    if locale:
+        args["locale_code"] = locale
+        chromium_args.append(f"--lang={locale}")
+    args["chromium_arg"] = ",".join(chromium_args)
+    return args
+
+
+def patch_json_path(obj: dict, dotted_key: str, value) -> None:
+    cur = obj
+    parts = dotted_key.split(".")
+    for key in parts[:-1]:
+        next_obj = cur.get(key)
+        if not isinstance(next_obj, dict):
+            next_obj = {}
+            cur[key] = next_obj
+        cur = next_obj
+    cur[parts[-1]] = value
+
+
+def patch_json_file(path: Path, updates: dict) -> bool:
+    if not path.exists():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(data, dict):
+            return False
+        for key, val in updates.items():
+            patch_json_path(data, key, val)
+        path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        return True
+    except Exception as exc:
+        log(f"patch json failed: {path}: {exc}")
         return False
 
 
-def wait_for_cloudflare(page, timeout=90):
-    start = time.time()
-    click_count = 0
+def normalize_profile_crash_state(user_data_dir: str) -> None:
+    if not user_data_dir:
+        return
+    base = Path(user_data_dir)
+    files = [
+        (base / "Default" / "Preferences", {"profile.exit_type": "Normal", "profile.exited_cleanly": True}),
+        (base / "Local State", {"profile.exit_type": "Normal", "profile.exited_cleanly": True}),
+    ]
+    patched = sum(1 for file_path, updates in files if patch_json_file(file_path, updates))
+    log(f"profile crash-state patched files: {patched}")
 
-    while time.time() - start < timeout:
-        if not _cf_iframe_exists(page) and _page_has_content(page):
-            log("  ✅ Cloudflare 已通过（页面已加载）")
+
+def cleanup_profile_locks(user_data_dir: str) -> None:
+    if not user_data_dir:
+        return
+    base = Path(user_data_dir)
+    lock_files = [
+        base / "SingletonLock",
+        base / "SingletonCookie",
+        base / "SingletonSocket",
+        base / "Default" / "SingletonLock",
+    ]
+    removed = 0
+    for lock in lock_files:
+        try:
+            if lock.exists() or lock.is_symlink():
+                lock.unlink()
+                removed += 1
+        except Exception as exc:
+            log(f"lock cleanup failed: {lock}: {exc}")
+    log(f"profile lock files removed: {removed}")
+
+
+def dismiss_chrome_crash_prompt() -> None:
+    try:
+        subprocess.run(["xdotool", "key", "Escape"], check=True)
+        time.sleep(0.2)
+        subprocess.run(["xdotool", "key", "Escape"], check=True)
+        log("crash prompt dismiss keys sent")
+    except Exception as exc:
+        log(f"crash prompt dismiss skipped: {exc}")
+
+
+def open_url(sb: SB, url: str, label: str) -> None:
+    log(f"open {label}: {url}")
+    sb.open(url)
+    time.sleep(READY_WAIT)
+    log(f"{label} URL: {current_url_safe(sb)}")
+
+
+def browser_fetch_json(sb: SB, path: str, timeout: int = 15) -> dict:
+    sb.driver.set_script_timeout(timeout)
+    return sb.driver.execute_async_script(
+        """
+        const path = arguments[0];
+        const done = arguments[arguments.length - 1];
+        fetch(path, {
+          method: 'GET',
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: { 'Accept': 'application/json' }
+        }).then(async (resp) => {
+          const text = await resp.text();
+          let body = null;
+          try { body = JSON.parse(text); } catch (_) {}
+          done({ ok: true, status: resp.status, url: resp.url, body, text });
+        }).catch((err) => {
+          done({ ok: false, error: String(err) });
+        });
+        """,
+        path,
+    )
+
+
+def is_waf_text(text: str) -> bool:
+    value = str(text or "")
+    return "CF_APP_WAF" in value or "为了更好的访问体验，请进行验证" in value or "AliyunCaptcha" in value
+
+
+def logout_via_api(sb: SB) -> None:
+    if not is_target_host(current_url_safe(sb)):
+        open_url(sb, SITE_URL, "site before logout")
+    result = browser_fetch_json(sb, "/api/user/logout")
+    body = result.get("body") if isinstance(result, dict) else None
+    log(f"logout API status={result.get('status') if isinstance(result, dict) else 'unknown'} body={body}")
+    if not (isinstance(body, dict) and body.get("success")):
+        raise RuntimeError(f"logout API failed: {result}")
+    time.sleep(1)
+
+
+def locate_github_login_control(sb: SB) -> dict:
+    result = sb.driver.execute_script(
+        r"""
+        const loginText = arguments[0];
+        const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        const textOf = (el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        const hrefOf = (el) => el.href || el.getAttribute('href') || '';
+        const controls = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+        const candidates = [];
+        for (const el of controls) {
+          if (!visible(el)) continue;
+          if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+          const text = textOf(el);
+          const href = hrefOf(el);
+          const hasGithubLogo = !!el.querySelector("img[aria-label='github_logo'], svg[class*='github'], .semi-icon-github_logo");
+          const exactText = text === loginText;
+          const githubText = /github/i.test(text) || text.includes('GitHub');
+          const githubHref = /github/i.test(href);
+          if (!exactText && !githubText && !githubHref && !hasGithubLogo) continue;
+          const r = el.getBoundingClientRect();
+          candidates.push({ el, text, href, hasGithubLogo, exactText, githubText, githubHref, area: Math.max(1, r.width * r.height) });
+        }
+        candidates.sort((a, b) => {
+          const score = (item) =>
+            (item.exactText ? 1000 : 0) +
+            (item.githubText ? 500 : 0) +
+            (item.githubHref ? 300 : 0) +
+            (item.hasGithubLogo ? 100 : 0);
+          return score(b) - score(a) || b.area - a.area;
+        });
+        const pick = candidates[0];
+        if (!pick) {
+          return { found: false, candidates: candidates.map((item) => ({ text: item.text, href: item.href })) };
+        }
+        const target = pick.el;
+        target.scrollIntoView({ block: 'center', inline: 'center' });
+        const r = target.getBoundingClientRect();
+        return {
+          found: true,
+          text: textOf(target),
+          href: hrefOf(target)
+        };
+        """,
+        LOGIN_TEXT,
+    )
+    return result if isinstance(result, dict) else {"found": False, "raw": result}
+
+
+def webdriver_click_github_login(sb: SB) -> None:
+    element = sb.driver.execute_script(
+        r"""
+        const loginText = arguments[0];
+        const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        const textOf = (el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        const controls = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+        return controls.find((el) => visible(el) && (textOf(el) === loginText || /github/i.test(textOf(el)))) || null;
+        """,
+        LOGIN_TEXT,
+    )
+    if not element:
+        raise RuntimeError("GitHub login control not found for WebDriver click")
+    element.click()
+
+
+def _left_login_page(sb: SB, timeout: float = 8.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if "github.com" in current_url_safe(sb):
             return True
-
-        rect = _get_cf_iframe_rect(page)
-        if rect:
-            cx = int(rect["left"] + 12)
-            cy = int(rect["top"] + rect["height"] / 2)
-
-            if click_count == 0:
-                log(f"  ⚡ 检测到 Cloudflare Turnstile，点击复选框...")
-
-            _cdp_click(page, cx, cy)
-            click_count += 1
-
-            for wait_i in range(20):
-                time.sleep(1)
-                iframe_gone = not _cf_iframe_exists(page)
-                page_loaded = _page_has_content(page)
-                if iframe_gone and page_loaded:
-                    log(f"  ✅ Cloudflare 通过（点击 {click_count} 次，{wait_i+1}s）")
+        try:
+            for h in sb.driver.window_handles:
+                sb.driver.switch_to.window(h)
+                if "github.com" in current_url_safe(sb):
                     return True
-                if wait_i % 5 == 4:
-                    log(f"  ⏳ 等待 CF 消失+页面加载... ({wait_i+1}s) iframe={not iframe_gone} content={page_loaded}")
-
-            log(f"  ⚠️ 点击后未通过，重试...")
-        else:
-            time.sleep(2)
-
-    log(f"  ❌ Cloudflare 验证超时（{timeout}s）")
-    send_tg_screenshot(page, "cf_timeout")
-    return False
-
-
-# ── Cookie 弹窗处理 ──────────────────────────────────────
-
-def dismiss_cookie_consent(page):
-    log("  → 检查 cookie 弹窗...")
-    try:
-        time.sleep(2)
-
-        called = page.run_js("""
-            try { __ncmp('save'); return true; } catch(e) { return false; }
-        """)
-        if called:
-            log("  ✓ 已调用 __ncmp('save')")
-            time.sleep(3)
-            return True
-
-        try:
-            coords = page.run_js("""
-                var btns = document.querySelectorAll('button.ncmp__btn');
-                for (var b of btns) {
-                    if (b.innerText.trim() === 'Accept') {
-                        var r = b.getBoundingClientRect();
-                        return {x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)};
-                    }
-                }
-                return null;
-            """)
-            if coords:
-                wi = page.run_js("""
-                    return {
-                        sx: window.screenX || 0,
-                        sy: window.screenY || 0,
-                        oh: window.outerHeight,
-                        ih: window.innerHeight
-                    };
-                """) or {"sx": 0, "sy": 0, "oh": 1080, "ih": 900}
-                bar = wi.get("oh", 1080) - wi.get("ih", 900)
-                if bar < 0 or bar > 200:
-                    bar = 85
-                ax = coords["x"] + wi.get("sx", 0)
-                ay = coords["y"] + wi.get("sy", 0) + bar
-                os.system(f"xdotool mousemove --sync {ax} {ay}")
-                time.sleep(0.3)
-                os.system("xdotool click 1")
-                log(f"  ✓ xdotool 点击 Accept ({ax}, {ay})")
-                time.sleep(3)
-                return True
-        except Exception as e:
-            log(f"  ⚠️ xdotool 点击失败: {e}")
-
-        try:
-            btn = page.ele('css:button.ncmp__btn:not(.ncmp__btn-border)', timeout=3)
-            if btn:
-                btn.click()
-                log("  ✓ 已点击 Accept 按钮")
-                time.sleep(3)
-                return True
-        except:
+        except Exception:
             pass
-
-        log("  → 未检测到 cookie 弹窗")
-    except Exception as e:
-        log(f"  ⚠️ 关闭 cookie 弹窗异常: {e}")
+        if is_target_host(current_url_safe(sb)) and path_from_url(current_url_safe(sb)) != "/login":
+            return True
+        time.sleep(0.4)
     return False
 
 
-# ── 读取页面文字 ──────────────────────────────────────────
+def click_github_login(sb: SB) -> None:
+    deadline = time.time() + 20
+    last = None
+    while time.time() < deadline:
+        last = locate_github_login_control(sb)
+        if last.get("found"):
+            break
+        time.sleep(0.5)
+    if not (isinstance(last, dict) and last.get("found")):
+        raise RuntimeError(f"GitHub login control not found: {last}")
+    log(f"GitHub login control: text={last.get('text')} href={last.get('href')}")
 
-def get_page_text(page):
+    # 优先 WebDriver 原生点击（Xvfb 下最稳，不吃屏幕坐标）
     try:
-        return page.run_js("return document.body.innerText;") or ""
-    except:
+        webdriver_click_github_login(sb)
+        if _left_login_page(sb):
+            log("login click via WebDriver ok")
+            return
+        log("WebDriver click didn't navigate, trying JS click")
+    except Exception as exc:
+        log(f"WebDriver click failed: {exc}")
+
+    # 兜底：JS click
+    try:
+        sb.driver.execute_script(
+            r"""
+            const t = arguments[0];
+            const vis = (el)=>!!(el.offsetWidth||el.offsetHeight||el.getClientRects().length);
+            const txt = (el)=>(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();
+            const el = Array.from(document.querySelectorAll('button,a,[role="button"]'))
+              .find(e=>vis(e)&&(txt(e)===t||/github/i.test(txt(e))));
+            if (el) el.click();
+            """,
+            LOGIN_TEXT,
+        )
+        if _left_login_page(sb):
+            log("login click via JS ok")
+            return
+    except Exception as exc:
+        log(f"JS click failed: {exc}")
+
+    raise RuntimeError(f"clicked GitHub login but stayed on /login; current={current_url_safe(sb)}")
+
+
+def page_text_sample(sb: SB, limit: int = 5000) -> str:
+    try:
+        return str(
+            sb.driver.execute_script(
+                "return (document.body && (document.body.innerText || document.body.textContent) || '').slice(0, arguments[0]);",
+                int(limit),
+            )
+            or ""
+        )
+    except Exception:
         return ""
 
 
-# ── 读取账户当前总金币余额 ───────────────────────────────────
-
-def get_total_coins(page):
-    selectors = [
-        '.maintitle span', 'h1.maintitle span',
-        '#coins', '.coins', '[data-coins]',
-        '#coin-balance', '.coin-balance', '.balance',
-        '.navbar .coins', 'span.coin-amount', '#coinAmount',
-    ]
-    for sel in selectors:
-        try:
-            val = page.run_js(f"""
-                var el = document.querySelector('{sel}');
-                return el ? el.innerText.trim() : null;
-            """)
-            if val:
-                m = re.search(r'[\d,]+', val)
-                if m:
-                    coins = m.group(0).replace(",", "")
-                    log(f"  💰 总金币余额: {coins}（选择器: {sel}）")
-                    return coins
-        except:
-            continue
-
-    text = get_page_text(page)
-    m = (re.search(r'(?:coins?|金币|积分)\s*[:：]?\s*([\d,]+)', text, re.IGNORECASE)
-         or re.search(r'([\d,]+)\s*(?:coins?|金币|积分)', text, re.IGNORECASE))
-    if m:
-        coins = m.group(1).replace(",", "")
-        log(f"  💰 总金币余额: {coins}（来源：页面文字）")
-        return coins
-
-    log("  ⚠️ 未能读取总金币余额")
-    return "未知"
-
-
-# ── CDK 提取 ─────────────────────────────────────────────
-
-def extract_latest_cdk(text):
-    pattern = re.findall(
-        r'Here is your Discord key for NopeCHA[:\s]+([a-z0-9]+).*?\(([^)]+)\)',
-        text, re.IGNORECASE | re.DOTALL
-    )
-    if not pattern:
-        return '', False
-
-    cdk, time_label = pattern[-1]
-    is_recent = '内' in time_label
-    log(f"  📋 最新 CDK 时间标记: {time_label} | 24h内: {is_recent}")
-    return cdk, is_recent
-
-
-# ── 注入 key 到插件 ───────────────────────────────────────
-
-def inject_nopecha_key(page, cdk):
-    log(f"💉 注入 key 到 NopeCHA 插件...")
-    page.get(f"https://nopecha.com/setup#{cdk}")
-    time.sleep(3)
-    log(f"✅ key 注入完成: {cdk[:4]}****{cdk[-4:]}")
-
-
-# ── 获取元素屏幕坐标（Discord 用）──────────────────────
-
-def get_element_screen_pos(page, selector):
+def parse_money_text(text: str) -> float | None:
+    match = re.search(r"\$\s*([0-9]+(?:\.[0-9]+)?)", str(text or ""))
+    if not match:
+        return None
     try:
-        info = page.run_js(f"""
-            var el = document.querySelector('{selector}');
-            if (!el) return null;
-            var r = el.getBoundingClientRect();
-            return {{
-                cx: r.left + r.width / 2,
-                cy: r.top + r.height / 2,
-                sx: window.screenX || 0,
-                sy: window.screenY || 0,
-                dh: window.outerHeight - window.innerHeight,
-                dw: (window.outerWidth - window.innerWidth) / 2
-            }};
-        """)
-        if not info:
-            return None, None
-        ox = int(info.get('sx', 0) + info.get('dw', 0))
-        oy = int(info.get('sy', 0) + info.get('dh', 0))
-        return int(info['cx']) + ox, int(info['cy']) + oy
-    except:
-        return None, None
+        return float(match.group(1))
+    except Exception:
+        return None
 
 
-# ── xdotool 点击（Discord 输入用）────────────────────────
-
-def xdo_click(page, x, y, label=""):
+def read_balance_from_page(sb: SB) -> dict:
     try:
-        wi = page.run_js("""
-            return {
-                sx: window.screenX || 0,
-                sy: window.screenY || 0,
-                oh: window.outerHeight,
-                ih: window.innerHeight
-            };
-        """) or {"sx": 0, "sy": 0, "oh": 1080, "ih": 900}
-        bar = wi.get("oh", 1080) - wi.get("ih", 900)
-        if bar < 0 or bar > 200:
-            bar = 85
-        ax = int(x + wi.get("sx", 0))
-        ay = int(y + wi.get("sy", 0) + bar)
-        os.system(f"xdotool mousemove --sync {ax} {ay}")
-        time.sleep(0.2)
-        os.system("xdotool click 1")
-        if label:
-            log(f"  🖱️ 点击 ({ax},{ay}) {label}")
-        return True
-    except Exception as e:
-        log(f"  ⚠️ xdotool 点击失败: {e}")
-        return False
+        payload = sb.driver.execute_script(
+            r"""
+            const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const text = norm(document.body && (document.body.innerText || document.body.textContent || ''));
+            const labelIndex = text.indexOf('当前余额');
+            const sample = labelIndex >= 0 ? text.slice(labelIndex, labelIndex + 120) : text.slice(0, 500);
+            const match = sample.match(/\$\s*([0-9]+(?:\.[0-9]+)?)/) || text.match(/\$\s*([0-9]+(?:\.[0-9]+)?)/);
+            return { balanceText: match ? match[0] : '', balanceAmount: match ? match[1] : '', sample };
+            """
+        )
+        if isinstance(payload, dict) and payload.get("balanceText"):
+            return payload
+    except Exception as exc:
+        log(f"read balance from page failed: {exc}")
+    return {"balanceText": "", "balanceAmount": "", "sample": ""}
 
 
-def keyboard_type(text):
-    for ch in text:
-        os.system(f'xdotool type --clearmodifiers --delay 80 -- "{ch}"')
-        time.sleep(random.uniform(0.05, 0.15))
-
-
-def keyboard_key(key):
-    os.system(f"xdotool key --clearmodifiers {key}")
-    time.sleep(0.1)
-
-
-# ── 等 Discord 消息区真正渲染出来（内容驱动，抗慢网）──────
-
-def wait_dm_rendered(page, timeout=25):
-    """
-    轮询直到聊天消息节点出现且正文有一定长度。
-    返回 True 表示消息区确实渲染完成；False 表示超时内未加载出来。
-    """
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            ready = page.run_js("""
-                return !!document.querySelector(
-                    '[data-list-id="chat-messages"] li,'
-                    + 'li[id^="chat-messages"],'
-                    + '[class*="messageListItem"],'
-                    + '[class*="messageContent"]'
-                );
-            """)
-            if ready:
-                txt_len = page.run_js("return (document.body.innerText || '').length;") or 0
-                if txt_len > 80:
-                    return True
-        except:
-            pass
+def open_wallet_and_read_balance(sb: SB) -> dict:
+    open_url(sb, WALLET_URL, "wallet")
+    deadline = time.time() + 25
+    last_url = ""
+    while time.time() < deadline:
+        url = current_url_safe(sb)
+        if url != last_url:
+            log(f"wallet URL: {url}")
+            last_url = url
+        if path_from_url(url) == "/login":
+            return {"loggedIn": False, "balanceText": "", "balanceAmount": ""}
+        balance = read_balance_from_page(sb)
+        if balance.get("balanceText"):
+            balance["loggedIn"] = True
+            log(f"balance page read: {balance.get('balanceText')}")
+            return balance
         time.sleep(1)
-    return False
+    return {"loggedIn": is_logged_in_by_url(sb), "balanceText": "", "balanceAmount": ""}
 
 
-# ── 打开私聊并轮询读取 CDK（区分「没加载」与「没有CDK」）──────
-
-def read_dm_cdk(page, load_timeout=30):
-    """
-    打开 Discord 私聊并稳健读取 CDK。
-    返回 (cdk, is_recent, rendered):
-      - rendered=True  表示消息区确实渲染完成（可信地判断有无 CDK）
-      - rendered=False 表示超时内页面没加载完（网络慢，不应据此判定"没有 CDK"）
-    """
-    page.get(DISCORD_DM_URL)
-
-    rendered = wait_dm_rendered(page, timeout=load_timeout)
-    if not rendered:
-        log("  ⚠️ 私聊消息区在超时内未渲染完成（可能网络慢）")
-        return '', False, False
-
-    # 已渲染，但懒加载可能还差最后一帧 → 多读几轮取稳定结果
-    last_cdk = ''
-    for _ in range(3):
-        text = get_page_text(page)
-        cdk, is_recent = extract_latest_cdk(text) if text else ('', False)
-        if cdk and is_recent:
-            return cdk, True, True
-        if cdk:
-            last_cdk = cdk
-        time.sleep(1.5)
-
-    # 消息区已渲染完成但没有 24h 内的 CDK → 确实没有
-    return last_cdk, False, True
+def is_logged_in_by_url(sb: SB) -> bool:
+    url = current_url_safe(sb)
+    return is_target_host(url) and path_from_url(url).startswith("/console")
 
 
-# ── 等频道输入框（slate editor）真正可交互 ────────────────
-
-def wait_channel_input_ready(page, timeout=30):
-    """轮询直到频道消息输入框存在且有可见尺寸。返回 True/False。"""
-    start = time.time()
-    while time.time() - start < timeout:
+def switch_to_best_target_tab(sb: SB) -> None:
+    try:
+        handles = list(sb.driver.window_handles)
+    except Exception:
+        return
+    best = None
+    best_score = -1
+    for handle in handles:
         try:
-            ok = page.run_js("""
-                var ed = document.querySelector('[data-slate-editor="true"]');
-                if (!ed) return false;
-                var r = ed.getBoundingClientRect();
-                return r.width > 0 && r.height > 0;
-            """)
-            if ok:
-                return True
-        except:
-            pass
-        time.sleep(1)
-    return False
-
-
-# ── 输入并验证命令确实发出去了 ────────────────────────────
-
-def type_command_verified(page, cmd="!nopecha", retries=3):
-    """
-    聚焦输入框 → CDP 注入文本 → 校验输入框确有命令 → CDP 回车
-    → 校验回车后输入框已清空（= 已发送）。任一步失败则重试。
-
-    注意：不再用 get_element_screen_pos + xdotool（屏幕坐标会重复叠加
-    标题栏偏移，导致点击落在输入框下方、焦点进不去）。改用 CDP，
-    完全绕开坐标误差。
-    """
-    sel = '[data-slate-editor="true"]'
-    for i in range(retries):
-        log(f"  → 输入命令尝试 {i+1}/{retries}...")
-
-        # 1) 聚焦输入框：DrissionPage 原生点击（CDP，viewport 坐标，可靠）+ JS focus 兜底
-        try:
-            ed = page.ele(f'css:{sel}', timeout=10)
-            ed.click()
-        except Exception as e:
-            log(f"  ⚠️ 定位/点击输入框失败: {e}")
-            time.sleep(2)
+            sb.driver.switch_to.window(handle)
+            url = current_url_safe(sb)
+        except Exception:
             continue
-        page.run_js("var ed=document.querySelector('%s'); if(ed) ed.focus();" % sel)
-        time.sleep(0.5)
-
-        # 2) 清空残留
-        try:
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="a",
-                         code="KeyA", modifiers=2)  # Ctrl+A
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="a",
-                         code="KeyA", modifiers=2)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Delete",
-                         code="Delete", windowsVirtualKeyCode=46, nativeVirtualKeyCode=46)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Delete",
-                         code="Delete", windowsVirtualKeyCode=46, nativeVirtualKeyCode=46)
-        except:
-            pass
-        time.sleep(0.3)
-
-        # 3) CDP 注入文本（插入到当前聚焦的可编辑元素，触发 input 事件）
-        try:
-            page.run_cdp("Input.insertText", text=cmd)
-        except Exception as e:
-            log(f"  ⚠️ insertText 失败，尝试键盘输入兜底: {e}")
-            keyboard_type(cmd)
-        time.sleep(random.uniform(0.5, 0.9))
-
-        # 4) 校验：输入框里确实有命令文本
-        cur = page.run_js(
-            "var ed=document.querySelector('%s'); return ed ? (ed.innerText||'').trim() : '';" % sel
-        ) or ''
-        log(f"  当前输入框内容: '{cur}'")
-
-        if cmd.strip() not in cur:
-            log("  ⚠️ 输入框仍未获取到命令文本，重试...")
-            time.sleep(2)
+        if not is_target_host(url):
             continue
-
-        # 5) CDP 回车发送
+        score = 1
+        path = path_from_url(url)
+        if path.startswith("/console") or path.startswith("/oauth"):
+            score = 10
+        elif path == "/login":
+            score = 5
+        if score > best_score:
+            best = handle
+            best_score = score
+    if best:
         try:
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Enter",
-                         code="Enter", windowsVirtualKeyCode=13, nativeVirtualKeyCode=13, text="\r")
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Enter",
-                         code="Enter", windowsVirtualKeyCode=13, nativeVirtualKeyCode=13)
-        except Exception as e:
-            log(f"  ⚠️ CDP 回车失败，尝试键盘兜底: {e}")
-            keyboard_key("Return")
-        time.sleep(1.5)
-
-        # 6) 校验：回车后输入框应清空 = 已成功发送
-        after = page.run_js(
-            "var ed=document.querySelector('%s'); return ed ? (ed.innerText||'').trim() : '';" % sel
-        ) or ''
-
-        if cmd.strip() not in after:
-            log("  ✅ 命令已成功发送（输入框已清空）")
-            return True
-
-        log("  ⚠️ 回车后输入框仍有内容，可能未发送，重试...")
-        time.sleep(2)
-
-    return False
-
-
-# ── 发送命令并轮询 CDK ────────────────────────────────────
-
-def send_command_and_poll(page):
-    page.get(DISCORD_CHANNEL_URL)
-
-    # 关键修复：先等频道输入框真正就绪，页面没加载好绝不敲命令
-    log("⏳ 等待频道输入框就绪...")
-    if not wait_channel_input_ready(page, timeout=30):
-        log("❌ 频道输入框超时未就绪（页面没加载好），本轮放弃发送")
-        return ''
-    # 再确认消息区渲染，避免 slash-command 面板等干扰
-    wait_dm_rendered(page, timeout=15)
-
-    log("⌨️ 发送 !nopecha 命令（带验证）...")
-    if not type_command_verified(page, "!nopecha", retries=3):
-        log("❌ !nopecha 命令发送失败（输入框/页面未就绪）")
-        return ''
-
-    log("✅ 命令已发送，等待私聊回复...")
-    time.sleep(5)
-
-    for attempt in range(20):
-        log(f"  [{attempt+1}/20] 打开私聊检查新 CDK...")
-
-        # 内容驱动读取：慢网会等到真正渲染完再判断
-        cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=30)
-        if cdk and is_recent:
-            log(f"✅ 提取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
-            return cdk
-
-        if not rendered:
-            log("  ⏳ 私聊未加载完成，稍后重试（不判定为无 CDK）...")
-
-        # 未拿到有效 CDK → 回频道等 bot 私聊回复
-        page.get(DISCORD_CHANNEL_URL)
-        time.sleep(4)
-
-    return ''
-
-
-# ── CDK 获取主逻辑 ────────────────────────────────────────
-
-def ensure_cdk(page):
-    log("=" * 50)
-    log("🔑 开始 CDK 检查流程")
-    log("=" * 50)
-
-    if "login" in (page.url or "").lower():
-        msg = "❌ Discord 登录态失效，请重新初始化 Profile"
-        log(msg)
-        send_tg(msg)
-        return ''
-
-    log("🔍 检查私聊是否已有24h内的 CDK...")
-    cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=40)
-
-    if cdk and is_recent:
-        log(f"✅ 已有24h内的 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
-        inject_nopecha_key(page, cdk)
-        return cdk
-
-    # 关键修复：私聊没加载完时不要立刻当成"没有 CDK"去重发命令，先重试读取
-    if not rendered:
-        for i in range(2):
-            log(f"  🔁 私聊未加载完成，重试读取 ({i+1}/2)...")
-            cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=40)
-            if cdk and is_recent:
-                log(f"✅ 重试读到24h内 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
-                inject_nopecha_key(page, cdk)
-                return cdk
-            if rendered:
-                break
-
-    log("📭 无24h内的 CDK，去频道发送命令领取新的...")
-    cdk = send_command_and_poll(page)
-
-    if not cdk:
-        msg = "❌ 未能获取 CDK，请检查 Discord"
-        log(msg)
-        send_tg(msg)
-        return ''
-
-    inject_nopecha_key(page, cdk)
-    return cdk
-
-
-# ── 强制关闭残留弹窗 ──────────────────────────────────────
-
-def force_close_all_modals(page):
-    log("  → 清理残留弹窗...")
-    try:
-        btn = page.ele('css:button.swal-button.swal-button--confirm', timeout=2)
-        if btn:
-            btn.click()
-            log("  ✓ 已关闭 SweetAlert 弹窗")
-            time.sleep(2)
-    except:
-        pass
-
-    try:
-        for selector in ['div.modal-content span.close', 'span.close', '.modal-content .close']:
-            try:
-                btn = page.ele(f'css:{selector}', timeout=1)
-                if btn:
-                    btn.click()
-                    log("  ✓ 已关闭广告弹窗")
-                    time.sleep(2)
-                    break
-            except:
-                pass
-    except:
-        pass
-
-
-# ── 处理弹窗并解析进度（唯一改动：用 JS 读弹窗文字）────
-
-def close_all_modals(page):
-    claimed, total = None, None
-    try:
-        log("  → 等待成功弹窗...")
-        # 等待弹窗出现
-        for _ in range(15):
-            has_modal = page.run_js("return !!document.querySelector('.swal-modal');")
-            if has_modal:
-                break
-            time.sleep(1)
-        time.sleep(1.5)
-
-        # 用 JS 读取弹窗内容（比 ele().text 更可靠）
-        try:
-            title = page.run_js("var el = document.querySelector('.swal-title'); return el ? el.innerText.trim() : '';") or ""
-            text  = page.run_js("var el = document.querySelector('.swal-text'); return el ? el.innerText.trim() : '';") or ""
-            log(f"  弹窗标题: {title}")
-            log(f"  弹窗内容: {text}")
-            m = re.search(r'(\d+)\s*/\s*(\d+)', text)
-            if m:
-                claimed, total = int(m.group(1)), int(m.group(2))
-                log(f"  📊 进度: {claimed}/{total}")
-        except Exception as e:
-            log(f"  ⚠️ 解析弹窗文本失败: {e}")
-
-        # 点击 OK
-        try:
-            page.run_js("var btn = document.querySelector('button.swal-button.swal-button--confirm'); if(btn) btn.click();")
-            log("  ✓ 已点击 OK")
-            time.sleep(2)
-        except:
+            sb.driver.switch_to.window(best)
+        except Exception:
             pass
 
-        # 等待弹窗消失
-        for _ in range(10):
-            still_there = page.run_js("return !!document.querySelector('.swal-modal');")
-            if not still_there:
-                break
-            time.sleep(1)
 
-        # 关闭广告弹窗
-        try:
-            for selector in ['div.modal-content span.close', 'span.close', '.modal-content .close']:
-                btn = page.run_js(f"var btn = document.querySelector('{selector}'); if(btn && btn.offsetParent) {{ btn.click(); return true; }} return false;")
-                if btn:
-                    log("  ✓ 已关闭广告弹窗")
-                    time.sleep(2)
-                    break
-        except:
-            pass
-
-    except Exception as e:
-        log(f"  ⚠️ 处理弹窗失败: {e}")
-
-    return claimed, total
-
-
-# ── 检查按钮状态 ──────────────────────────────────────────
-
-def check_button_ready(page, max_retries=3):
-    selector = 'button.btn.green[type="submit"]'
-    for i in range(max_retries):
-        try:
-            log(f"  → 检查按钮状态 ({i+1}/{max_retries})...")
-            page.ele(f'css:{selector}', timeout=10)
-            btn = page.ele(f'css:{selector}')
-            text = btn.text.strip()
-            log(f"  按钮文本: '{text}'")
-
-            enabled = page.run_js(f"""
-                var el = document.querySelector('{selector}');
-                return el ? !el.disabled : false;
-            """)
-            if enabled:
-                log("  ✓ 按钮可用")
-                return True
-
-            if "complete the captcha" in text.lower():
-                log("  ⚠️ 需要 hCaptcha，等待 NopeCHA 插件自动解决...")
-                for _ in range(20):
-                    time.sleep(3)
-                    enabled = page.run_js(f"""
-                        var el = document.querySelector('{selector}');
-                        return el ? !el.disabled : false;
-                    """)
-                    if enabled:
-                        log("  ✓ hCaptcha 已自动解决，按钮可用")
-                        return True
-                log("  ⚠️ 等待超时，hCaptcha 未解决")
-                return False
-
-            elif "you are on cooldown" in text.lower():
-                log("  ⚠️ 冷却中")
-                return False
-            else:
-                log("  ⚠️ 按钮 disabled（其他原因）")
-                return False
-
-        except Exception as e:
-            log(f"  ⚠️ 检查按钮失败: {e}")
-            return False
-
-    return False
-
-
-# ── 领取主循环 ────────────────────────────────────────────
-
-def click_claim_coins(page, max_attempts=15):
-    selector = 'button.btn.green[type="submit"]'
-    total_coins = 10
-    claimed_so_far = 0
-    task_completed = False
-
-    log(f"\n🎯 开始领取流程（最多 {max_attempts} 次）...")
-
-    for attempt in range(1, max_attempts + 1):
-        if task_completed:
-            break
-
-        remaining = total_coins - claimed_so_far
-        log(f"\n{'='*50}")
-        log(f"【尝试 {attempt}/{max_attempts} | 剩余: {max(0, remaining)}】")
-        log(f"{'='*50}")
-
-        force_close_all_modals(page)
-
-        if not check_button_ready(page):
-            try:
-                btn = page.ele(f'css:{selector}')
-                if "you are on cooldown" in btn.text.lower():
-                    log("  → 冷却等待 35 秒...")
-                    time.sleep(35)
-                    continue
-            except:
-                pass
-            time.sleep(8)
-            continue
-
-        try:
-            enabled = page.run_js(f"""
-                var el = document.querySelector('{selector}');
-                return el ? !el.disabled : false;
-            """)
-            if not enabled:
-                log("  ⚠️ 按钮不可用，跳过")
-                time.sleep(8)
-                continue
-            log("  → 点击领取按钮...")
-            btn = page.ele(f'css:{selector}')
-            btn.click()
-            log("  ✓ 已点击")
-        except Exception as e:
-            log(f"  ⚠️ 点击失败: {e}")
-            time.sleep(8)
-            continue
-
-        log("  → 等待 18 秒确保弹窗出现...")
-        time.sleep(18)
-
-        claimed, total = close_all_modals(page)
-
-        if claimed is not None and total is not None:
-            claimed_so_far = claimed
-            total_coins = total
-            log(f"  📊 进度: {claimed}/{total}")
-            if claimed >= total:
-                log("  🎉 已完成全部领取！")
-                task_completed = True
-        else:
-            log("  ⚠️ 无法获取进度")
-
-        time.sleep(1 if task_completed else 10)
-
-    if task_completed or claimed_so_far >= total_coins:
-        log(f"\n✅ 任务完成！最终进度: {claimed_so_far}/{total_coins}")
-        return True, claimed_so_far, total_coins
-    else:
-        log(f"\n⚠️ 未完成目标（当前: {claimed_so_far}/{total_coins}）")
-        return False, claimed_so_far, total_coins
-
-
-# ── 主流程 ────────────────────────────────────────────────
-
-def main():
-    success, claimed, total = False, 0, 0
-    cdk = ""
-    total_balance = "未知"
-
-    log("=" * 50)
-    log("🚀 启动：CDK 注入 + Bot-Hosting 金币领取 (DrissionPage)")
-    log(f"🖥️  运行模式: {'CI' if IS_CI else '本地'}")
-    log("=" * 50)
-
-    # ── 启动浏览器 ──────────────────────────────────────
-    co = ChromiumOptions()
-    co.set_argument('--no-sandbox')
-    co.set_argument('--disable-dev-shm-usage')
-    co.set_argument('--disable-gpu')
-    co.set_argument('--window-size=1280,900')
-    co.set_user_data_path(PROFILE_DIR)
-
-    # 加载 NopeCHA 扩展
-    if os.path.isdir(NOPECHA_EXT_DIR):
-        co.add_extension(NOPECHA_EXT_DIR)
-        log(f"📦 加载扩展: {NOPECHA_EXT_DIR}")
-    else:
-        log(f"⚠️ 扩展目录不存在: {NOPECHA_EXT_DIR}")
-
-    if PROXY_URL:
-        co.set_argument(f'--proxy-server={PROXY_URL}')
-        log(f"🌐 代理: {PROXY_URL}")
-
-    log("🔧 启动浏览器...")
+def find_github_tab(sb: SB) -> str | None:
     try:
-        page = ChromiumPage(co)
-    except Exception as e:
-        log(f"❌ 浏览器启动失败: {e}")
+        handles = list(sb.driver.window_handles)
+    except Exception:
+        return None
+    for h in handles:
+        try:
+            sb.driver.switch_to.window(h)
+            if "github.com" in current_url_safe(sb):
+                return h
+        except Exception:
+            continue
+    return None
+
+
+def handle_github_login(sb: SB) -> None:
+    url = current_url_safe(sb)
+    if "github.com" not in url:
         return
 
-    try:
-        # ── Step 1: 确保 CDK 有效并注入 ──────────────────
-        log("📂 打开 Discord 频道...")
-        page.get(DISCORD_CHANNEL_URL)
-        time.sleep(8)
-
-        cdk = ensure_cdk(page)
-        if not cdk:
+    # 1. 账号密码
+    if sb.is_element_visible('input[name="login"]'):
+        if not GH_USERNAME or not GH_PASSWORD:
+            log("WARNING: 缺少 GH_USERNAME / GH_PASSWORD，无法自动登录 GitHub")
             return
-
-        # ── Step 2: 领取 Bot-Hosting 金币 ────────────────
-        log(f"\n→ 访问 {TARGET_URL}")
-        page.get(TARGET_URL)
-        time.sleep(5)
-
-        # Cloudflare 处理
-        if not wait_for_cloudflare(page, timeout=90):
-            msg = "❌ Cloudflare 验证失败，无法访问 bot-hosting"
-            log(msg)
-            send_tg(msg)
-            return
-
-        send_tg_screenshot(page, "panel_ready")
-        log(f"  当前 URL: {page.url}")
-
-        # 写入 token
-        log("→ 写入 localStorage token")
-        current_url = page.url or ''
-        log(f"  当前 URL: {current_url}")
-
-        if 'bot-hosting.net' not in current_url:
-            page.get(TARGET_URL)
-            time.sleep(3)
-            if _is_cf_page(page):
-                wait_for_cloudflare(page, timeout=60)
-
-        page.run_js(f"localStorage.setItem('token', '{TOKEN}')")
-        log("  ✓ token 已写入 localStorage")
-
-        page.run_js(f"""
-            document.cookie = 'token={TOKEN}; path=/; domain=.bot-hosting.net; max-age=86400';
-        """)
-        log("  ✓ token 已写入 cookie")
-
-        verify = page.run_js("return localStorage.getItem('token');")
-        log(f"  验证 localStorage: {'✅ 已写入' if verify else '❌ 为空'}")
-
-        log("  → 刷新页面...")
-        page.refresh()
-        time.sleep(5)
-
-        after_url = page.url or ''
-        log(f"  刷新后 URL: {after_url}")
-        if '/login' in after_url:
-            log("  ⚠️ 仍在登录页，尝试直接访问 panel...")
-            page.get(TARGET_URL)
-            time.sleep(5)
-            if _is_cf_page(page):
-                wait_for_cloudflare(page, timeout=60)
-
-        log(f"→ 跳转到 {EARN_URL}")
-        page.get(EARN_URL)
-        time.sleep(5)
-
-        if _is_cf_page(page):
-            log("  ⚡ earn 页面 Cloudflare...")
-            wait_for_cloudflare(page, timeout=60)
-
-        # 关闭 cookie 弹窗
-        dismiss_cookie_consent(page)
-        time.sleep(2)
-        dismiss_cookie_consent(page)
+        log("填入 GitHub 账号密码...")
+        sb.type('input[name="login"]', GH_USERNAME)
+        time.sleep(0.5)
+        sb.type('input[name="password"]', GH_PASSWORD)
+        time.sleep(0.5)
+        sb.click('input[type="submit"], button[type="submit"]')
         time.sleep(3)
 
-        send_tg_screenshot(page, "earn_ready")
+    # 2. 设备验证
+    url = current_url_safe(sb)
+    if "verified-device" in url or "device-verification" in url:
+        log("需要设备验证，等待批准（60s）...")
+        send_tg_message("⚠️ GitHub 需要设备验证，请去邮箱/App 点击批准！等待 60 秒...")
+        for i in range(60):
+            time.sleep(1)
+            u = current_url_safe(sb)
+            if "verified-device" not in u and "device-verification" not in u:
+                log("设备验证通过")
+                send_tg_message("✅ 设备验证通过")
+                break
+            if i and i % 10 == 0:
+                try:
+                    sb.refresh_page()
+                except Exception:
+                    pass
 
-        log("→ 检查初始按钮状态")
-        check_button_ready(page, max_retries=2)
+    # 3. 两步验证
+    url = current_url_safe(sb)
+    if "two-factor" in url:
+        for sel in ['a:contains("Use an authentication app")',
+                    'button:contains("Authenticator app")',
+                    'button:contains("Use authenticator")']:
+            try:
+                if sb.is_element_visible(sel):
+                    sb.click(sel)
+                    time.sleep(2)
+            except Exception:
+                pass
+        url = current_url_safe(sb)
+        if "two-factor/mobile" in url:
+            send_tg_message("⚠️ GitHub Mobile 两步验证：请打开手机 App 批准本次登录，等待中...")
+            for _ in range(45):
+                time.sleep(2)
+                if "two-factor" not in current_url_safe(sb):
+                    break
+        else:
+            send_tg_message(f"🔐 需要 GitHub 两步验证码，用户 {GH_USERNAME} 正在登录，请直接回复 6 位数字：")
+            code = tg_wait_code(timeout=90)
+            if code:
+                log("收到验证码，正在填入...")
+                for sel in ['input[autocomplete="one-time-code"]', 'input[name="app_otp"]',
+                            'input#app_totp', 'input#otp', 'input[inputmode="numeric"]']:
+                    if sb.is_element_visible(sel):
+                        sb.type(sel, code)
+                        break
+                time.sleep(1)
+                try:
+                    if sb.is_element_visible('button:contains("Verify")'):
+                        sb.click('button:contains("Verify")')
+                    else:
+                        sb.execute_script(
+                            "document.activeElement.form && document.activeElement.form.submit();"
+                        )
+                except Exception:
+                    pass
+                for _ in range(15):  # 等它真正离开 2FA，避免重复要码
+                    time.sleep(1)
+                    if "two-factor" not in current_url_safe(sb):
+                        break
+            else:
+                log("未收到 TG 验证码")
 
-        log("→ 开始自动领取")
-        success, claimed, total = click_claim_coins(page, max_attempts=15)
+    # 4. OAuth 授权页
+    url = current_url_safe(sb)
+    if "login/oauth/authorize" in url:
+        log("OAuth 授权页，点击 Authorize...")
+        for sel in ['button[name="authorize"]', 'button:contains("Authorize")']:
+            try:
+                if sb.is_element_visible(sel):
+                    sb.click(sel)
+                    time.sleep(3)
+                    break
+            except Exception:
+                pass
 
-        log("→ 读取账户总金币余额...")
-        total_balance = get_total_coins(page)
 
-        log("→ 保持页面 30 秒...")
-        time.sleep(30)
-        log("✅ 完成，关闭浏览器")
+def wait_for_login_success(sb: SB) -> None:
+    deadline = time.time() + WAIT_AFTER_CLICK
+    last_url = ""
+    while time.time() < deadline:
+        # 发现 github 标签：切过去自动处理登录/2FA/授权
+        gh = find_github_tab(sb)
+        if gh:
+            sb.driver.switch_to.window(gh)
+            url = current_url_safe(sb)
+            if url != last_url:
+                log(f"github 流程: {url}")
+                last_url = url
+            try:
+                handle_github_login(sb)
+            except Exception as exc:
+                log(f"handle_github_login 异常: {exc}")
+            time.sleep(1)
+            continue
 
-    except Exception as e:
-        log(f"❌ 运行异常: {e}")
-        send_tg_screenshot(page, "error")
-    finally:
-        try:
-            page.quit()
-        except:
-            pass
+        # 没有 github 标签，回到目标站点看是否已进 console
+        switch_to_best_target_tab(sb)
+        url = current_url_safe(sb)
+        if url != last_url:
+            log(f"waiting login URL: {url}")
+            last_url = url
+        if is_logged_in_by_url(sb):
+            log(f"login confirmed by console URL: {url}")
+            return
+        if is_waf_text(page_text_sample(sb)):
+            raise RuntimeError("login flow hit WAF verification page")
+        time.sleep(1)
+    raise RuntimeError(f"timed out waiting for login success; current={current_url_safe(sb)}")
 
-    if success:
-        send_tg(
-            f"✅ Bot-Hosting 金币领取完成\n"
-            f"📊 本次进度: {claimed}/{total}\n"
-            f"💰 总金币余额: {total_balance}\n"
-            f"🔑 CDK: {cdk[:4]}****{cdk[-4:]}"
-        )
-    else:
-        send_tg(
-            f"⚠️ Bot-Hosting 金币领取未完成\n"
-            f"📊 本次进度: {claimed}/{total}\n"
-            f"💰 总金币余额: {total_balance}\n"
-            f"🔑 CDK: {cdk[:4]}****{cdk[-4:]}"
-        )
+
+def compute_result(data: dict) -> bool:
+    before_num = parse_money_text(data.get("balanceBeforeText") or "")
+    after_num = parse_money_text(data.get("balanceAfterText") or "")
+    if before_num is not None and after_num is not None:
+        delta = after_num - before_num
+        data["balanceDelta"] = delta
+        data["balanceDeltaText"] = f"{delta:+.2f}"
+        if delta > 0:
+            data["reason"] = f"签到成功，余额增加 {data['balanceDeltaText']}"
+        elif delta == 0:
+            data["reason"] = "今日可能已签到，余额未变化"
+        else:
+            data["reason"] = f"登录完成，但余额减少 {data['balanceDeltaText']}"
+        return True
+    if data.get("balanceAfterText"):
+        data["balanceDeltaText"] = "N/A"
+        data["reason"] = f"登录成功，当前余额 {data.get('balanceAfterText')}"
+        return True
+    data["reason"] = "未读取到登录后的余额"
+    return False
+
+
+def main() -> None:
+    user_loaded = load_env_file(USER_ENV_FILE)
+    env_file_from_var = (os.environ.get("AGENTROUTER_ENV_FILE") or "").strip()
+    if env_file_from_var and env_file_from_var != USER_ENV_FILE:
+        load_env_file(env_file_from_var)
+    elif not user_loaded:
+        log("no external env file loaded; using current process env only")
+    refresh_config()
+
+    profile_dir = (os.environ.get("BROWSER_USER_DATA_DIR") or "").strip()
+    data = {
+        "siteUrl": SITE_URL,
+        "loginUrl": LOGIN_URL,
+        "loginText": LOGIN_TEXT,
+        "profileDir": profile_dir,
+        "scriptRevision": SCRIPT_REVISION,
+    }
+    screenshot_path = None
+
+    try:
+        log("AgentRouter check-in task started")
+        log(f"SCRIPT_REVISION: {SCRIPT_REVISION}")
+        log(f"SITE_URL: {SITE_URL}")
+        log(f"LOGIN_URL: {LOGIN_URL}")
+        log(f"AGENTROUTER_USE_UC: {int(USE_UC)}")
+        log(f"BROWSER_USER_DATA_DIR: {profile_dir}")
+        log(f"BROWSER_CHROME_PATH: {(os.environ.get('BROWSER_CHROME_PATH') or '').strip()}")
+        log(f"GH_USERNAME set: {bool(GH_USERNAME)} / GH_PASSWORD set: {bool(GH_PASSWORD)}")
+        normalize_profile_crash_state(profile_dir)
+        cleanup_profile_locks(profile_dir)
+
+        with SB(**build_sb_args()) as sb:
+            log("browser started")
+            dismiss_chrome_crash_prompt()
+            open_url(sb, SITE_URL, "site")
+
+            before_balance = open_wallet_and_read_balance(sb)
+            data["startLoggedIn"] = bool(before_balance.get("loggedIn"))
+            data["balanceBeforeText"] = before_balance.get("balanceText") or ""
+            data["balanceBeforeAmount"] = before_balance.get("balanceAmount") or ""
+            if data["startLoggedIn"]:
+                log(f"already logged in, balance before: {data['balanceBeforeText'] or 'not found'}")
+                logout_via_api(sb)
+            else:
+                log("session appears logged out")
+
+            open_url(sb, LOGIN_URL, "login")
+            if is_logged_in_by_url(sb):
+                log("login URL redirected to logged-in session; logging out once more")
+                logout_via_api(sb)
+                open_url(sb, LOGIN_URL, "login after forced logout")
+
+            click_github_login(sb)
+            wait_for_login_success(sb)
+
+            after_balance = open_wallet_and_read_balance(sb)
+            data["balanceAfterText"] = after_balance.get("balanceText") or ""
+            data["balanceAfterAmount"] = after_balance.get("balanceAmount") or ""
+            data["url"] = current_url_safe(sb)
+            screenshot_path = save_screenshot(sb)
+
+        ok = compute_result(data)
+        write_result(ok, error=None if ok else data.get("reason"), data=data, screenshot_path=screenshot_path)
+        send_tg_message(build_tg_card(ok, data=data, error="" if ok else data.get("reason", "")))
+        if not ok:
+            raise RuntimeError(data.get("reason") or "check-in failed")
+        log(f"check-in completed: {data.get('reason')}")
+    except Exception as exc:
+        error = str(exc)
+        log(f"task failed: {error}")
+        write_result(False, error=error, data=data, screenshot_path=screenshot_path)
+        send_tg_message(build_tg_card(False, data=data, error=error))
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
