@@ -132,59 +132,68 @@ jobs:
             exit 1
           fi
 
-      - name: 9. 启动 noVNC + cloudflared + Chrome（带自愈 watchdog）
-        env:
-          PROXY_STR: ${{ secrets.PROXY_STR }}
-          WAIT_MINUTES: ${{ github.event.inputs.wait_minutes }}
-          OPEN_URL: ${{ github.event.inputs.open_url }}
+            - name: 9. 启动隧道并打印远程链接
         run: |
           set -e
-
           # 下载 cloudflared
           curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-          # 启动虚拟屏幕
-          Xvfb :99 -screen 0 1280x800x24 &
+          # 虚拟屏 + 窗口管理器（nohup 保证跨步骤存活）
+          nohup Xvfb :99 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 &
           export DISPLAY=:99
           sleep 1
-
-          # 启动窗口管理器
-          fluxbox &
+          nohup fluxbox >/tmp/fluxbox.log 2>&1 &
           sleep 1
 
-          # 启动 VNC（无密码）— 不用 -bg/-quiet，输出到日志，便于排查卡死
-          x11vnc -display :99 -forever -nopw -rfbport 5900 -shared -o /tmp/x11vnc.log &
+          # VNC + noVNC
+          nohup x11vnc -display :99 -forever -nopw -rfbport 5900 -shared -o /tmp/x11vnc.log >/dev/null 2>&1 &
+          sleep 2
+          nohup websockify --web /usr/share/novnc 6080 localhost:5900 >/tmp/websockify.log 2>&1 &
           sleep 2
 
-          # 启动 noVNC
-          websockify --web /usr/share/novnc 6080 localhost:5900 &
-          sleep 2
-
-          # 启动 cloudflared 临时隧道
+          # cloudflared 临时隧道
           nohup cloudflared tunnel --url http://localhost:6080 > /tmp/cf.log 2>&1 &
-          sleep 8
 
-          # 提取访问链接
-          CF_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
+          # 轮询等链接出现（最多 ~40s），别死等固定秒数
+          CF_URL=""
+          for i in $(seq 1 40); do
+            CF_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf.log | head -1)
+            [ -n "$CF_URL" ] && break
+            sleep 1
+          done
           if [ -z "$CF_URL" ]; then
             echo "❌ 未获取到 trycloudflare 链接，打印 /tmp/cf.log："
             tail -200 /tmp/cf.log || true
             exit 1
           fi
 
-          echo ""
-          echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║  🌐 浏览器打开下面的链接远程操控 Chrome                     ║"
-          echo "║                                                              ║"
-          echo "║  👉 ${CF_URL}/vnc.html?autoconnect=true&reconnect=true"
-          echo "║                                                              ║"
-          echo "║  建议打开页面：chrome://extensions                            ║"
-          echo "║  用来确认 NopeCHA 插件是否加载、reload 后 key 是否生效       ║"
-          echo "╚══════════════════════════════════════════════════════════════╝"
+          VNC_URL="${CF_URL}/vnc.html?autoconnect=true&reconnect=true"
 
-          # 构造 Chrome 启动参数
+          # 传给后续步骤
+          echo "DISPLAY=:99"        >> "$GITHUB_ENV"
+          echo "CF_URL=$CF_URL"     >> "$GITHUB_ENV"
+          echo "VNC_URL=$VNC_URL"   >> "$GITHUB_ENV"
+
+          # 三处都打，确保一定看得到
+          echo "🌐 远程操控链接：$VNC_URL"                       # 普通日志
+          echo "::notice title=远程操控链接::$VNC_URL"           # 顶部注解横幅
+          {                                                       # Job Summary 单独页
+            echo "## 🌐 远程操控 Chrome"
+            echo ""
+            echo "**$VNC_URL**"
+            echo ""
+            echo "建议打开 chrome://extensions 确认 NopeCHA 插件是否加载。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 10. 启动 Chrome 并等待远程操作
+        env:
+          PROXY_STR: ${{ secrets.PROXY_STR }}
+          WAIT_MINUTES: ${{ github.event.inputs.wait_minutes }}
+          OPEN_URL: ${{ github.event.inputs.open_url }}
+        run: |
+          export DISPLAY=:99
           TARGET_URL="${OPEN_URL:-chrome://extensions}"
 
           CHROME_ARGS="--user-data-dir=$HOME/.chrome-profile-discord \
@@ -196,15 +205,14 @@ jobs:
             --no-sandbox \
             --window-size=1280,800"
 
-          # 有代理则走代理
           if [ -n "$PROXY_STR" ]; then
             CHROME_ARGS="$CHROME_ARGS --proxy-server=http://127.0.0.1:8080"
             echo "🌐 Chrome 已配置代理"
           fi
 
-          # 加载 NopeCHA 插件
           CHROME_ARGS="$CHROME_ARGS --load-extension=$GITHUB_WORKSPACE/chromium"
           echo "🧩 NopeCHA 插件将以 --load-extension 方式加载"
+          echo "🔗 远程链接（复看）：$VNC_URL"
 
           CHROME_BIN="${{ steps.setup-chrome.outputs.chrome-path }}"
           echo "🌐 Chrome for Testing: $CHROME_BIN"
@@ -219,10 +227,7 @@ jobs:
           start_chrome
 
           WAIT_SECS=$(( ${WAIT_MINUTES:-10} * 60 ))
-          echo ""
           echo "⏳ 等待 ${WAIT_MINUTES:-10} 分钟供远程操作（watchdog 每 5s 自检）..."
-
-          # watchdog：Chrome 退出则重启；同时把最近日志打出来方便定位
           for i in $(seq 1 $((WAIT_SECS/5))); do
             if [ -f /tmp/chrome.pid ]; then
               PID=$(cat /tmp/chrome.pid)
@@ -235,13 +240,13 @@ jobs:
             sleep 5
           done
 
-      - name: 10. 覆盖保存 Chrome Profile 到 Cache
+      - name: 11. 覆盖保存 Chrome Profile 到 Cache
         uses: actions/cache/save@v4
         with:
           path: ~/.chrome-profile-discord
           key: chrome-profile-discord-v1-${{ github.run_id }}
 
-      - name: 11. 完成
+      - name: 12. 完成
         run: |
           echo "✅ Chrome Profile 已保存，本次调试结束"
           echo "下次自动领取任务将使用最新 Profile"
