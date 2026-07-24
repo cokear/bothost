@@ -132,7 +132,7 @@ jobs:
             exit 1
           fi
 
-            - name: 9. 启动隧道并打印远程链接
+      - name: 9. 启动隧道并打印远程链接
         run: |
           set -e
           # 下载 cloudflared
