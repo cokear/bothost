@@ -727,62 +727,82 @@ def is_logged_in(page):
     return False
 
 
-def click_discord_authorize(page, timeout=60):
-    """在 Discord OAuth 页点「授权」。若已自动跳回 bot-hosting 则直接成功。
+def _scroll_discord_permissions(page):
+    """把 Discord 授权页的权限列表滚到底——不滚到底授权按钮点了不生效。"""
+    try:
+        page.run_js("""
+            var sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
+                '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
+                'div[class*="modal"] div[style*="overflow"]','div[class*="root"] div[style*="overflow"]'];
+            var scrolled = false;
+            sels.forEach(function(sel){
+                document.querySelectorAll(sel).forEach(function(el){
+                    var s = getComputedStyle(el);
+                    if (el.scrollHeight > el.clientHeight &&
+                        ['auto','scroll'].some(function(v){return s.overflowY===v||s.overflow===v;}))
+                        { el.scrollTop = el.scrollHeight; scrolled = true; }
+                });
+            });
+            if (!scrolled) document.querySelectorAll('div').forEach(function(el){
+                if (el.scrollHeight > el.clientHeight + 10) {
+                    var s = getComputedStyle(el);
+                    if (['auto','scroll','hidden'].indexOf(s.overflowY) !== -1) el.scrollTop = el.scrollHeight;
+                }
+            });
+            window.scrollTo(0, document.body.scrollHeight);
+        """)
+    except Exception as e:
+        log(f"  ⚠️ 滚动权限列表异常: {e}")
 
-    注意 1：必须用 location.hostname 判断当前域名，不能对整段 URL 子串匹配 ——
-    授权页 URL 带 redirect_uri=https://legacy.bot-hosting.net/... 会误判成完成。
-    注意 2：Discord 是 React，JS 的 element.click() 常常触发不了真正的 OAuth 提交，
-    必须用 CDP 派发真实鼠标事件（trusted event）点按钮坐标。
+
+def _click_authorize_btn(page):
+    """滚动权限列表后点击授权按钮（CDP 真实点击 + JS 兜底）。返回是否点到按钮。"""
+    finder = """
+        var btns = Array.from(document.querySelectorAll('button'));
+        var target = btns.find(function(b){
+            var t = (b.innerText || '').trim().toLowerCase();
+            return (t.indexOf('authorize') !== -1 || t.indexOf('授权') !== -1)
+                   && t.indexOf('cancel') === -1 && t.indexOf('取消') === -1;
+        });
+        if (!target) target = document.querySelector('button[class*="primary"]');
     """
+    rect = page.run_js(finder + """
+        if (!target) return null;
+        target.scrollIntoView({block:'center'});
+        var r = target.getBoundingClientRect();
+        return {x:r.left+r.width/2, y:r.top+r.height/2, w:r.width, disabled:!!target.disabled};
+    """)
+    if not rect:
+        log("  ⏳ 授权按钮尚未出现...")
+        return False
+    if rect.get('disabled'):
+        log("  ⏳ 授权按钮 disabled，等待...")
+        return False
+    if rect.get('w', 0) > 10:
+        _cdp_click(page, int(rect['x']), int(rect['y']))   # CDP 真实鼠标事件（trusted）
+    page.run_js(finder + " if (target) target.click();")     # JS 双保险
+    return True
+
+
+def click_discord_authorize(page, timeout=60):
+    """在 Discord OAuth 页滚动权限列表并点「授权」。若已跳回 bot-hosting 则直接成功。"""
     start = time.time()
     clicked_once = False
     while time.time() - start < timeout:
         host = (page.run_js("return location.hostname || '';") or '').lower()
         path = (page.run_js("return location.pathname || '';") or '').lower()
 
-        # 真正的当前域名是 bot-hosting，且已离开登录/回调路径 = OAuth 完成
         if 'bot-hosting.net' in host and '/login' not in path:
             log("  ✅ 已跳回 bot-hosting（OAuth 完成）")
             return True
 
         if 'discord.com' in host and 'oauth2/authorize' in path:
-            # 取授权按钮中心坐标（viewport 坐标，供 CDP 使用）
-            rect = page.run_js("""
-                var btns = Array.from(document.querySelectorAll('button'));
-                var target = btns.find(function(b){
-                    var t = (b.innerText || '').trim();
-                    return /授权|Authorize/i.test(t) && !/取消|Cancel/i.test(t);
-                });
-                if (!target) target = document.querySelector('button[class*="primary"]');
-                if (!target) return null;
-                if (target.disabled) return {disabled: true};
-                target.scrollIntoView({block: 'center'});
-                var r = target.getBoundingClientRect();
-                return {x: r.left + r.width/2, y: r.top + r.height/2,
-                        w: r.width, h: r.height};
-            """)
-            if rect and rect.get('disabled'):
-                log("  ⏳ 授权按钮仍 disabled，等待...")
-            elif rect and rect.get('w', 0) > 10:
-                # CDP 真实鼠标点击（trusted event）
-                _cdp_click(page, int(rect['x']), int(rect['y']))
-                # JS click 双保险
-                page.run_js("""
-                    var btns = Array.from(document.querySelectorAll('button'));
-                    var target = btns.find(function(b){
-                        var t = (b.innerText || '').trim();
-                        return /授权|Authorize/i.test(t) && !/取消|Cancel/i.test(t);
-                    });
-                    if (!target) target = document.querySelector('button[class*="primary"]');
-                    if (target) target.click();
-                """)
-                if not clicked_once:
-                    log("  🖱️ 已点击 Discord「授权」按钮（CDP + JS）")
-                    clicked_once = True
-                time.sleep(3)
-            else:
-                log("  ⏳ 等待授权按钮出现...")
+            _scroll_discord_permissions(page)
+            time.sleep(1.5)
+            if _click_authorize_btn(page) and not clicked_once:
+                log("  🖱️ 已点击 Discord「授权」按钮（滚动+CDP+JS）")
+                clicked_once = True
+            time.sleep(3)
         time.sleep(1.5)
 
     log("  ⚠️ 等待 Discord 授权/跳转超时")
@@ -807,15 +827,29 @@ def login_with_discord(page):
     page.get(LOGIN_URL)
     time.sleep(4)
 
-    click_discord_authorize(page, timeout=45)
+    # 参考可用脚本的思路：authorized_seen 标志 + 轮询；授权页判断放前面避免误判
+    authorized_seen = False
+    for _ in range(25):
+        host = (page.run_js("return location.hostname || '';") or '').lower()
+        path = (page.run_js("return location.pathname || '';") or '').lower()
 
-    # 等待跳回 + 确认登录（callback 可能再过一次 CF）
-    for _ in range(20):
-        if _is_cf_page(page):
-            wait_for_cloudflare(page, timeout=60)
-        if is_logged_in(page):
-            log("  ✅ Discord OAuth 登录成功")
-            return True
+        if 'discord.com' in host and 'oauth2/authorize' in path:
+            authorized_seen = True
+            log("  [OAuth] 授权页：滚动权限列表并点击授权...")
+            _scroll_discord_permissions(page)
+            time.sleep(1.5)
+            _click_authorize_btn(page)
+            time.sleep(3)
+            continue
+
+        if 'bot-hosting.net' in host and ('/login' not in path or authorized_seen):
+            if _is_cf_page(page):
+                log("  ⚡ 回调页 Cloudflare...")
+                wait_for_cloudflare(page, timeout=60)
+            if is_logged_in(page):
+                log("  ✅ Discord OAuth 登录成功")
+                return True
+
         time.sleep(2)
 
     log("  ❌ Discord OAuth 登录失败")
