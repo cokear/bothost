@@ -709,9 +709,12 @@ def ensure_cdk(page):
 # ── Discord OAuth 登录 bot-hosting（新增，替代 token 注入）──
 
 def is_logged_in(page):
-    """已登录 bot-hosting 面板判定：不在 /login 且有 token / 面板内容"""
-    url = (page.url or '').lower()
-    if '/login' in url:
+    """已登录 bot-hosting 面板判定：当前域名是 bot-hosting、不在 /login，且有 token / 面板内容"""
+    host = (page.run_js("return location.hostname || '';") or '').lower()
+    path = (page.run_js("return location.pathname || '';") or '').lower()
+    if 'bot-hosting.net' not in host:
+        return False
+    if '/login' in path:
         return False
     try:
         if page.run_js("return !!localStorage.getItem('token');"):
@@ -719,24 +722,30 @@ def is_logged_in(page):
     except:
         pass
     # 兜底：在 panel 页且有实际内容
-    if 'bot-hosting.net' in url and '/panel' in url:
+    if '/panel' in path:
         return _page_has_content(page)
     return False
 
 
 def click_discord_authorize(page, timeout=45):
-    """在 Discord OAuth 页点「授权」。若已自动跳回 bot-hosting 则直接成功。"""
+    """在 Discord OAuth 页点「授权」。若已自动跳回 bot-hosting 则直接成功。
+
+    注意：必须用 location.hostname 判断当前所在域名，不能对整段 URL 做子串匹配 ——
+    Discord 授权页的 URL 里带 redirect_uri=https://legacy.bot-hosting.net/...，
+    直接 'bot-hosting.net' in url 会误判成"已完成"从而跳过点授权。
+    """
     start = time.time()
     clicked_once = False
     while time.time() - start < timeout:
-        url = (page.url or '').lower()
+        host = (page.run_js("return location.hostname || '';") or '').lower()
+        path = (page.run_js("return location.pathname || '';") or '').lower()
 
-        # 已跳回 bot-hosting = OAuth 完成
-        if 'bot-hosting.net' in url and '/login' not in url:
+        # 真正的当前域名是 bot-hosting，且已离开登录/回调路径 = OAuth 完成
+        if 'bot-hosting.net' in host and '/login' not in path:
             log("  ✅ 已跳回 bot-hosting（OAuth 完成）")
             return True
 
-        if 'discord.com' in url and 'oauth2/authorize' in url:
+        if 'discord.com' in host and 'oauth2/authorize' in path:
             clicked = page.run_js("""
                 var btns = Array.from(document.querySelectorAll('button'));
                 var target = btns.find(function(b){
