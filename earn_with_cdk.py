@@ -727,12 +727,13 @@ def is_logged_in(page):
     return False
 
 
-def click_discord_authorize(page, timeout=45):
+def click_discord_authorize(page, timeout=60):
     """在 Discord OAuth 页点「授权」。若已自动跳回 bot-hosting 则直接成功。
 
-    注意：必须用 location.hostname 判断当前所在域名，不能对整段 URL 做子串匹配 ——
-    Discord 授权页的 URL 里带 redirect_uri=https://legacy.bot-hosting.net/...，
-    直接 'bot-hosting.net' in url 会误判成"已完成"从而跳过点授权。
+    注意 1：必须用 location.hostname 判断当前域名，不能对整段 URL 子串匹配 ——
+    授权页 URL 带 redirect_uri=https://legacy.bot-hosting.net/... 会误判成完成。
+    注意 2：Discord 是 React，JS 的 element.click() 常常触发不了真正的 OAuth 提交，
+    必须用 CDP 派发真实鼠标事件（trusted event）点按钮坐标。
     """
     start = time.time()
     clicked_once = False
@@ -746,19 +747,38 @@ def click_discord_authorize(page, timeout=45):
             return True
 
         if 'discord.com' in host and 'oauth2/authorize' in path:
-            clicked = page.run_js("""
+            # 取授权按钮中心坐标（viewport 坐标，供 CDP 使用）
+            rect = page.run_js("""
                 var btns = Array.from(document.querySelectorAll('button'));
                 var target = btns.find(function(b){
                     var t = (b.innerText || '').trim();
                     return /授权|Authorize/i.test(t) && !/取消|Cancel/i.test(t);
                 });
                 if (!target) target = document.querySelector('button[class*="primary"]');
-                if (target) { target.click(); return true; }
-                return false;
+                if (!target) return null;
+                if (target.disabled) return {disabled: true};
+                target.scrollIntoView({block: 'center'});
+                var r = target.getBoundingClientRect();
+                return {x: r.left + r.width/2, y: r.top + r.height/2,
+                        w: r.width, h: r.height};
             """)
-            if clicked:
+            if rect and rect.get('disabled'):
+                log("  ⏳ 授权按钮仍 disabled，等待...")
+            elif rect and rect.get('w', 0) > 10:
+                # CDP 真实鼠标点击（trusted event）
+                _cdp_click(page, int(rect['x']), int(rect['y']))
+                # JS click 双保险
+                page.run_js("""
+                    var btns = Array.from(document.querySelectorAll('button'));
+                    var target = btns.find(function(b){
+                        var t = (b.innerText || '').trim();
+                        return /授权|Authorize/i.test(t) && !/取消|Cancel/i.test(t);
+                    });
+                    if (!target) target = document.querySelector('button[class*="primary"]');
+                    if (target) target.click();
+                """)
                 if not clicked_once:
-                    log("  🖱️ 已点击 Discord「授权」按钮")
+                    log("  🖱️ 已点击 Discord「授权」按钮（CDP + JS）")
                     clicked_once = True
                 time.sleep(3)
             else:
