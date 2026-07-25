@@ -3,6 +3,7 @@
 """
 Bot-Hosting 金币自动领取 (DrissionPage 版)
 - Discord 获取 NopeCHA CDK → 注入插件
+- Discord OAuth 登录 Bot-Hosting（替代 token 注入，免过期）
 - Bot-Hosting 自动领取金币
 - Cloudflare Turnstile 自动处理 (CDP)
 """
@@ -21,10 +22,11 @@ PROFILE_DIR     = os.getenv("BROWSER_USER_DATA_DIR",
 NOPECHA_EXT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium")
 
 DISCORD_CHANNEL_URL = "https://discord.com/channels/1046086326077882479/1243188924520726538"
-DISCORD_DM_URL      = "https://discord.com/channels/@me/1519516877074731018"
+DISCORD_DM_URL      = "https://discord.com/channels/@me/1514785932203528202"
 
 TARGET_URL = "https://legacy.bot-hosting.net/panel/"
 EARN_URL   = "https://legacy.bot-hosting.net/panel/earn"
+LOGIN_URL  = "https://legacy.bot-hosting.net/login/discord"
 TOKEN      = os.getenv("TOKEN")
 
 TG_TOKEN   = os.getenv("TG_BOT_TOKEN")
@@ -704,6 +706,94 @@ def ensure_cdk(page):
     return cdk
 
 
+# ── Discord OAuth 登录 bot-hosting（新增，替代 token 注入）──
+
+def is_logged_in(page):
+    """已登录 bot-hosting 面板判定：不在 /login 且有 token / 面板内容"""
+    url = (page.url or '').lower()
+    if '/login' in url:
+        return False
+    try:
+        if page.run_js("return !!localStorage.getItem('token');"):
+            return True
+    except:
+        pass
+    # 兜底：在 panel 页且有实际内容
+    if 'bot-hosting.net' in url and '/panel' in url:
+        return _page_has_content(page)
+    return False
+
+
+def click_discord_authorize(page, timeout=45):
+    """在 Discord OAuth 页点「授权」。若已自动跳回 bot-hosting 则直接成功。"""
+    start = time.time()
+    clicked_once = False
+    while time.time() - start < timeout:
+        url = (page.url or '').lower()
+
+        # 已跳回 bot-hosting = OAuth 完成
+        if 'bot-hosting.net' in url and '/login' not in url:
+            log("  ✅ 已跳回 bot-hosting（OAuth 完成）")
+            return True
+
+        if 'discord.com' in url and 'oauth2/authorize' in url:
+            clicked = page.run_js("""
+                var btns = Array.from(document.querySelectorAll('button'));
+                var target = btns.find(function(b){
+                    var t = (b.innerText || '').trim();
+                    return /授权|Authorize/i.test(t) && !/取消|Cancel/i.test(t);
+                });
+                if (!target) target = document.querySelector('button[class*="primary"]');
+                if (target) { target.click(); return true; }
+                return false;
+            """)
+            if clicked:
+                if not clicked_once:
+                    log("  🖱️ 已点击 Discord「授权」按钮")
+                    clicked_once = True
+                time.sleep(3)
+            else:
+                log("  ⏳ 等待授权按钮出现...")
+        time.sleep(1.5)
+
+    log("  ⚠️ 等待 Discord 授权/跳转超时")
+    return False
+
+
+def login_with_discord(page):
+    log("=" * 50)
+    log("🔐 使用 Discord OAuth 登录 bot-hosting")
+    log("=" * 50)
+
+    page.get(TARGET_URL)
+    time.sleep(5)
+    if _is_cf_page(page):
+        wait_for_cloudflare(page, timeout=90)
+
+    if is_logged_in(page):
+        log("  ✅ 已是登录态，跳过 OAuth")
+        return True
+
+    log("  → 触发 Discord 登录 (/login/discord)...")
+    page.get(LOGIN_URL)
+    time.sleep(4)
+
+    click_discord_authorize(page, timeout=45)
+
+    # 等待跳回 + 确认登录（callback 可能再过一次 CF）
+    for _ in range(20):
+        if _is_cf_page(page):
+            wait_for_cloudflare(page, timeout=60)
+        if is_logged_in(page):
+            log("  ✅ Discord OAuth 登录成功")
+            return True
+        time.sleep(2)
+
+    log("  ❌ Discord OAuth 登录失败")
+    send_tg_screenshot(page, "discord_login_fail")
+    return False
+
+
 # ── 强制关闭残留弹窗 ──────────────────────────────────────
 
 def force_close_all_modals(page):
@@ -963,55 +1053,15 @@ def main():
         if not cdk:
             return
 
-        # ── Step 2: 领取 Bot-Hosting 金币 ────────────────
-        log(f"\n→ 访问 {TARGET_URL}")
-        page.get(TARGET_URL)
-        time.sleep(5)
-
-        # Cloudflare 处理
-        if not wait_for_cloudflare(page, timeout=90):
-            msg = "❌ Cloudflare 验证失败，无法访问 bot-hosting"
+        # ── Step 2: 用 Discord OAuth 登录 bot-hosting ─────
+        if not login_with_discord(page):
+            msg = "❌ Discord OAuth 登录失败，无法进入面板"
             log(msg)
             send_tg(msg)
             return
 
         send_tg_screenshot(page, "panel_ready")
         log(f"  当前 URL: {page.url}")
-
-        # 写入 token
-        log("→ 写入 localStorage token")
-        current_url = page.url or ''
-        log(f"  当前 URL: {current_url}")
-
-        if 'bot-hosting.net' not in current_url:
-            page.get(TARGET_URL)
-            time.sleep(3)
-            if _is_cf_page(page):
-                wait_for_cloudflare(page, timeout=60)
-
-        page.run_js(f"localStorage.setItem('token', '{TOKEN}')")
-        log("  ✓ token 已写入 localStorage")
-
-        page.run_js(f"""
-            document.cookie = 'token={TOKEN}; path=/; domain=.bot-hosting.net; max-age=86400';
-        """)
-        log("  ✓ token 已写入 cookie")
-
-        verify = page.run_js("return localStorage.getItem('token');")
-        log(f"  验证 localStorage: {'✅ 已写入' if verify else '❌ 为空'}")
-
-        log("  → 刷新页面...")
-        page.refresh()
-        time.sleep(5)
-
-        after_url = page.url or ''
-        log(f"  刷新后 URL: {after_url}")
-        if '/login' in after_url:
-            log("  ⚠️ 仍在登录页，尝试直接访问 panel...")
-            page.get(TARGET_URL)
-            time.sleep(5)
-            if _is_cf_page(page):
-                wait_for_cloudflare(page, timeout=60)
 
         log(f"→ 跳转到 {EARN_URL}")
         page.get(EARN_URL)
