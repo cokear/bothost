@@ -1,0 +1,31 @@
+name: 📥 下载 Discord Profile 缓存
+
+on:
+  workflow_dispatch:
+    inputs:
+      cache_key:
+        description: '请输入你要下载的 Cache Key (例如: chrome-profile-discord-v1-30061076981)'
+        required: true
+        type: string
+
+jobs:
+  download-profile:
+    name: 📥 提取并打包缓存
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 按照原路径还原 Cache
+      - name: 还原 Chrome Profile 缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.chrome-profile-discord
+          key: ${{ inputs.cache_key }}
+
+      # 2. 将还原出的文件夹打包成 Artifact 以供下载
+      - name: 将缓存打包提供下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: discord-profile-data
+          path: ~/.chrome-profile-discord
+          # 压缩包会在 1 天后过期自动删除，节省空间
+          retention-days: 1
