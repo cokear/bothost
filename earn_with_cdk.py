@@ -514,22 +514,162 @@ def read_dm_cdk(page, load_timeout=30):
     return last_cdk, False, True
 
 
-# ── 等频道输入框（slate editor）真正可交互 ────────────────
+# ── 频道底部「发消息」输入框（绝不能点到右上角搜索）────────
+
+# Discord 里有多处 slate / textbox：右上角 Search、成员搜索、频道消息框。
+# 旧逻辑 querySelector('[data-slate-editor=true]') 常命中搜索栏。
+_FIND_CHANNEL_COMPOSER_JS = r"""
+() => {
+  function vis(el) {
+    if (!el) return false;
+    try {
+      var st = getComputedStyle(el);
+      if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+      if (parseFloat(st.opacity || '1') < 0.05) return false;
+      var r = el.getBoundingClientRect();
+      return r.width > 40 && r.height > 12;
+    } catch (e) { return false; }
+  }
+  function labelOf(el) {
+    return ((el.getAttribute('aria-label') || '') + ' '
+      + (el.getAttribute('placeholder') || '') + ' '
+      + (el.getAttribute('data-placeholder') || '') + ' '
+      + (el.getAttribute('aria-placeholder') || '')).toLowerCase();
+  }
+  function isSearch(el) {
+    var lab = labelOf(el);
+    if (/search|搜索|查找/.test(lab) && !/message|消息|给 |发送/.test(lab)) return true;
+    // 右上角搜索：一般在视口上半且偏右
+    try {
+      var r = el.getBoundingClientRect();
+      if (r.top < 120 && r.left > window.innerWidth * 0.35) {
+        if (/search|搜索/.test(lab) || el.closest('[class*="searchBar"],[class*="SearchBar"],form[role="search"]'))
+          return true;
+      }
+    } catch (e) {}
+    if (el.closest('[class*="searchBar"],[class*="SearchBar"],[class*="search-bar"],form[role="search"]'))
+      return true;
+    return false;
+  }
+  function isComposerLike(el) {
+    if (!vis(el) || isSearch(el)) return false;
+    var lab = labelOf(el);
+    // 明确的消息框文案
+    if (/^message |^message#|message @|给 .* 发消息|发送消息到|在 .* 中发送|write.*message|chat input/i.test(lab))
+      return true;
+    if (/message|消息|发送|给 #|给 @/.test(lab) && !/search|搜索/.test(lab))
+      return true;
+    // 结构：在 channelTextArea / form 底部区域
+    if (el.closest('[class*="channelTextArea"],[class*="ChannelTextArea"],form[class*="form"]')) {
+      var r = el.getBoundingClientRect();
+      if (r.top > window.innerHeight * 0.45) return true;
+    }
+    return false;
+  }
+  var nodes = Array.prototype.slice.call(document.querySelectorAll(
+    '[data-slate-editor="true"], div[role="textbox"][contenteditable="true"], div[role="textbox"]'
+  ));
+  var cands = nodes.filter(isComposerLike);
+  if (!cands.length) {
+    // 退路：所有可见 textbox/slate，排除搜索，取最靠视口底部的
+    cands = nodes.filter(function(el) {
+      return vis(el) && !isSearch(el);
+    });
+  }
+  if (!cands.length) return null;
+  cands.sort(function(a, b) {
+    var ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    // 更靠下优先，其次更宽
+    return (rb.bottom - ra.bottom) || (rb.width - ra.width);
+  });
+  var el = cands[0];
+  var r = el.getBoundingClientRect();
+  // 打标，后续读写用同一节点
+  document.querySelectorAll('[data-earn-composer="1"]').forEach(function(x) {
+    try { x.removeAttribute('data-earn-composer'); } catch (e) {}
+  });
+  el.setAttribute('data-earn-composer', '1');
+  return {
+    top: r.top, left: r.left, width: r.width, height: r.height,
+    bottom: r.bottom,
+    label: (el.getAttribute('aria-label') || '').slice(0, 80),
+    text: ((el.innerText || el.textContent || '') + '').trim().slice(0, 80)
+  };
+}
+"""
+
+
+def _channel_composer_info(page):
+    """定位频道底部发消息框；排除右上角 Search。"""
+    try:
+        # run_js 既可传函数体也可传 IIFE；统一用表达式调用
+        info = page.run_js("return (%s)();" % _FIND_CHANNEL_COMPOSER_JS.lstrip())
+        if isinstance(info, dict) and info.get("width"):
+            return info
+    except Exception as e:
+        log(f"  ⚠️ 定位频道输入框失败: {e}")
+    return None
+
+
+def _composer_text(page):
+    try:
+        return page.run_js("""
+            var el = document.querySelector('[data-earn-composer="1"]')
+                  || document.querySelector('[class*="channelTextArea"] [data-slate-editor="true"]')
+                  || document.querySelector('[class*="channelTextArea"] [role="textbox"]');
+            if (!el) return '';
+            return ((el.innerText || el.textContent || '') + '').trim();
+        """) or ""
+    except Exception:
+        return ""
+
+
+def _focus_channel_composer(page):
+    """点击并 focus 频道消息框（非搜索栏）。成功返回 info dict。"""
+    info = _channel_composer_info(page)
+    if not info:
+        return None
+    # 点中心，确保 focus 进 contenteditable
+    try:
+        cx = int(info["left"] + info["width"] / 2)
+        cy = int(info["top"] + min(info["height"] / 2, 18))
+        _cdp_click(page, cx, cy)
+    except Exception:
+        pass
+    try:
+        page.run_js("""
+            var el = document.querySelector('[data-earn-composer="1"]');
+            if (!el) return false;
+            el.scrollIntoView({block:'center'});
+            try { el.click(); } catch (e) {}
+            try { el.focus(); } catch (e) {}
+            // 再点内部可编辑子节点
+            var inner = el.querySelector('[data-slate-node="element"], [contenteditable="true"]') || el;
+            try { inner.focus(); } catch (e2) {}
+            return true;
+        """)
+    except Exception:
+        pass
+    time.sleep(0.35)
+    return info
+
 
 def wait_channel_input_ready(page, timeout=30):
-    """轮询直到频道消息输入框存在且有可见尺寸。返回 True/False。"""
+    """轮询直到频道底部「发消息」框就绪（不是右上角搜索）。"""
     start = time.time()
     while time.time() - start < timeout:
         try:
-            ok = page.run_js("""
-                var ed = document.querySelector('[data-slate-editor="true"]');
-                if (!ed) return false;
-                var r = ed.getBoundingClientRect();
-                return r.width > 0 && r.height > 0;
-            """)
-            if ok:
-                return True
-        except:
+            info = _channel_composer_info(page)
+            if info and info.get("bottom", 0) > 100:
+                # 必须在偏下半屏，避免搜索栏误判
+                if info.get("top", 0) > (page.run_js("return window.innerHeight;") or 800) * 0.35:
+                    log(f"  ✓ 频道输入框就绪 label={info.get('label')!r} top={info.get('top'):.0f}")
+                    return True
+                # 有的小窗 top 也可能偏中，只要不是搜索且靠下即可
+                if info.get("top", 0) > 150 and not re.search(r"search|搜索", str(info.get("label") or ""), re.I):
+                    log(f"  ✓ 频道输入框就绪(宽松) label={info.get('label')!r} top={info.get('top'):.0f}")
+                    return True
+        except Exception:
             pass
         time.sleep(1)
     return False
@@ -539,43 +679,58 @@ def wait_channel_input_ready(page, timeout=30):
 
 def type_command_verified(page, cmd="!nopecha", retries=3):
     """
-    聚焦输入框 → CDP 注入文本 → 校验输入框确有命令 → CDP 回车
-    → 校验回车后输入框已清空（= 已发送）。任一步失败则重试。
+    聚焦【频道底部消息框】→ CDP 注入文本 → 校验 → 回车发送。
 
-    注意：不再用 get_element_screen_pos + xdotool（屏幕坐标会重复叠加
-    标题栏偏移，导致点击落在输入框下方、焦点进不去）。改用 CDP，
-    完全绕开坐标误差。
+    禁止用全局 [data-slate-editor]：Discord 右上角搜索也是同类控件，
+    querySelector 第一个常点到 Search（截图复现：命令进了搜索栏）。
     """
-    sel = '[data-slate-editor="true"]'
     for i in range(retries):
         log(f"  → 输入命令尝试 {i+1}/{retries}...")
 
-        # 1) 聚焦输入框：DrissionPage 原生点击（CDP，viewport 坐标，可靠）+ JS focus 兜底
+        # 0) 若焦点还在搜索栏，先 Esc 关掉搜索 UI
         try:
-            ed = page.ele(f'css:{sel}', timeout=10)
-            ed.click()
-        except Exception as e:
-            log(f"  ⚠️ 定位/点击输入框失败: {e}")
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyDown", key="Escape", code="Escape",
+                windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
+            )
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyUp", key="Escape", code="Escape",
+                windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
+            )
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+        info = _focus_channel_composer(page)
+        if not info:
+            log("  ⚠️ 未找到频道底部消息输入框（可能仍在加载）")
             time.sleep(2)
             continue
-        page.run_js("var ed=document.querySelector('%s'); if(ed) ed.focus();" % sel)
-        time.sleep(0.5)
+        lab = str(info.get("label") or "")
+        if re.search(r"search|搜索", lab, re.I) and not re.search(r"message|消息", lab, re.I):
+            log(f"  ⚠️ 仍疑似搜索框 label={lab!r}，重试定位...")
+            time.sleep(1)
+            continue
+        log(f"  定位消息框: label={lab!r} top={info.get('top'):.0f}")
 
-        # 2) 清空残留
+        # 清空残留（在已 focus 的 composer 上）
         try:
             page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="a",
                          code="KeyA", modifiers=2)  # Ctrl+A
             page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="a",
                          code="KeyA", modifiers=2)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Delete",
-                         code="Delete", windowsVirtualKeyCode=46, nativeVirtualKeyCode=46)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Delete",
-                         code="Delete", windowsVirtualKeyCode=46, nativeVirtualKeyCode=46)
-        except:
+            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Backspace",
+                         code="Backspace", windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
+            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Backspace",
+                         code="Backspace", windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
+        except Exception:
             pass
         time.sleep(0.3)
 
-        # 3) CDP 注入文本（插入到当前聚焦的可编辑元素，触发 input 事件）
+        # 再 focus 一次再插入，避免焦点跳回搜索
+        _focus_channel_composer(page)
         try:
             page.run_cdp("Input.insertText", text=cmd)
         except Exception as e:
@@ -583,18 +738,52 @@ def type_command_verified(page, cmd="!nopecha", retries=3):
             keyboard_type(cmd)
         time.sleep(random.uniform(0.5, 0.9))
 
-        # 4) 校验：输入框里确实有命令文本
-        cur = page.run_js(
-            "var ed=document.querySelector('%s'); return ed ? (ed.innerText||'').trim() : '';" % sel
-        ) or ''
-        log(f"  当前输入框内容: '{cur}'")
+        cur = _composer_text(page)
+        log(f"  当前消息框内容: '{cur}'")
 
+        # 若文本跑进了搜索栏，composer 会是空的或没有命令
         if cmd.strip() not in cur:
-            log("  ⚠️ 输入框仍未获取到命令文本，重试...")
+            # 探测搜索栏是否吃了文本
+            try:
+                search_txt = page.run_js("""
+                    var s = document.querySelector(
+                      'input[aria-label*="Search" i], input[aria-label*="搜索"],'
+                      + '[class*="searchBar"] input, [class*="SearchBar"] input,'
+                      + 'form[role="search"] input, [aria-label*="Search" i][role="combobox"]'
+                    );
+                    if (!s) {
+                      var boxes = document.querySelectorAll('[data-slate-editor="true"], [role="textbox"]');
+                      for (var i=0;i<boxes.length;i++){
+                        var lab=((boxes[i].getAttribute('aria-label')||'')+'').toLowerCase();
+                        var r=boxes[i].getBoundingClientRect();
+                        if ((/search|搜索/.test(lab) || r.top<120) && r.left>window.innerWidth*0.3)
+                          return ((boxes[i].innerText||boxes[i].textContent||boxes[i].value||'')+'').trim();
+                      }
+                      return '';
+                    }
+                    return ((s.value||s.innerText||s.textContent||'')+'').trim();
+                """) or ""
+            except Exception:
+                search_txt = ""
+            if cmd.strip() in str(search_txt):
+                log(f"  ⚠️ 命令误入搜索栏: '{search_txt}' — 清空搜索并重试")
+                try:
+                    page.run_cdp(
+                        "Input.dispatchKeyEvent", type="keyDown", key="Escape",
+                        code="Escape", windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
+                    )
+                    page.run_cdp(
+                        "Input.dispatchKeyEvent", type="keyUp", key="Escape",
+                        code="Escape", windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
+                    )
+                except Exception:
+                    pass
+            else:
+                log("  ⚠️ 消息框仍未获取到命令文本，重试...")
             time.sleep(2)
             continue
 
-        # 5) CDP 回车发送
+        # 回车发送
         try:
             page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Enter",
                          code="Enter", windowsVirtualKeyCode=13, nativeVirtualKeyCode=13, text="\r")
@@ -605,16 +794,12 @@ def type_command_verified(page, cmd="!nopecha", retries=3):
             keyboard_key("Return")
         time.sleep(1.5)
 
-        # 6) 校验：回车后输入框应清空 = 已成功发送
-        after = page.run_js(
-            "var ed=document.querySelector('%s'); return ed ? (ed.innerText||'').trim() : '';" % sel
-        ) or ''
-
+        after = _composer_text(page)
         if cmd.strip() not in after:
-            log("  ✅ 命令已成功发送（输入框已清空）")
+            log("  ✅ 命令已成功发送（消息框已清空）")
             return True
 
-        log("  ⚠️ 回车后输入框仍有内容，可能未发送，重试...")
+        log("  ⚠️ 回车后消息框仍有内容，可能未发送，重试...")
         time.sleep(2)
 
     return False
