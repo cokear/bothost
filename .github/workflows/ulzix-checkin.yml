@@ -38,17 +38,17 @@ jobs:
       - name: 4. 还原 Chrome Profile（含 Discord 登录态 + NopeCHA）
         uses: actions/cache/restore@v4
         with:
-          path: ~/.chrome-profile-ulzix
-          key: chrome-profile-ulzix-v1-${{ github.run_id }}
+          path: ~/.chrome-profile-discord
+          key: chrome-profile-discord-v1-${{ github.run_id }}
           restore-keys: |
-            chrome-profile-ulzix-v1-
+            chrome-profile-discord-v1-
           fail-on-cache-miss: false
 
       - name: 5. 清理 Chrome Profile 锁文件
         run: |
-          rm -f ~/.chrome-profile-ulzix/SingletonLock
-          rm -f ~/.chrome-profile-ulzix/SingletonSocket
-          rm -f ~/.chrome-profile-ulzix/SingletonCookie
+          rm -f ~/.chrome-profile-discord/SingletonLock
+          rm -f ~/.chrome-profile-discord/SingletonSocket
+          rm -f ~/.chrome-profile-discord/SingletonCookie
           echo "✅ 锁文件清理完成"
 
       - name: 6. 按需拉起代理（Sing-Box）
@@ -73,7 +73,7 @@ jobs:
           ACCOUNTS:              ${{ secrets.ULZIX_ACCOUNTS }}
           TG_BOT_TOKEN:          ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:            ${{ secrets.TG_CHAT_ID }}
-          BROWSER_USER_DATA_DIR: /home/runner/.chrome-profile-ulzix
+          BROWSER_USER_DATA_DIR: /home/runner/.chrome-profile-discord
         run: |
           if [ -n "$PROXY_STR" ]; then
             export BROWSER_PROXY="http://127.0.0.1:8080"
