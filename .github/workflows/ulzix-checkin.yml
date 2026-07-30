@@ -4,8 +4,7 @@ on:
   repository_dispatch:
     types: [ulzix]
   workflow_dispatch:
-  schedule:
-    - cron: '10 3 * * *'  # 每天 UTC 03:10 (北京时间 11:10)
+
 
 concurrency:
   group: ulzix-checkin
