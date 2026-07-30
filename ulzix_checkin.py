@@ -24,10 +24,7 @@ PROFILE_DIR = os.getenv("BROWSER_USER_DATA_DIR",
                         os.path.expanduser("~/.chrome-profile-ulzix"))
 
 # NopeCHA 扩展目录（CDP 回退时备用）
-NOPECHA_EXT_DIR = os.getenv(
-    "NOPECHA_EXT_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium"),
-)
+NOPECHA_EXT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium")
 
 # Discord（领取 CDK）
 DISCORD_CHANNEL_URL = "https://discord.com/channels/1046086326077882479/1243188924520726538"
@@ -1045,20 +1042,20 @@ def main():
     log("🚀 Ulzix 每日签到 (DrissionPage + NopeCHA)")
     log("=" * 50)
 
-    # ── 启动浏览器 ──
+    # ── 启动浏览器 ──────────────────────────────────────
     co = ChromiumOptions()
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--disable-gpu")
-    co.set_argument("--window-size=1280,900")
+    co.set_argument('--no-sandbox')
+    co.set_argument('--disable-dev-shm-usage')
+    co.set_argument('--disable-gpu')
+    co.set_argument('--window-size=1280,900')
     co.set_user_data_path(PROFILE_DIR)
 
-    # 加载 NopeCHA 扩展（CDP 回退时备用）
+    # 加载 NopeCHA 扩展
     if os.path.isdir(NOPECHA_EXT_DIR):
         co.add_extension(NOPECHA_EXT_DIR)
         log(f"📦 加载扩展: {NOPECHA_EXT_DIR}")
     else:
-        log(f"⚠️ 扩展目录不存在（仅 API 模式）")
+        log(f"⚠️ 扩展目录不存在: {NOPECHA_EXT_DIR}")
 
     if PROXY_URL:
         co.set_argument(f"--proxy-server={PROXY_URL}")
