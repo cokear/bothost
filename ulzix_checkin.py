@@ -277,21 +277,8 @@ def inject_cdk_to_extension(page, cdk):
         return False
     log(f"💉 注入 CDK 到 NopeCHA 扩展: {cdk[:4]}****{cdk[-4:]}")
     page.get(f"https://nopecha.com/setup#{cdk}")
-    time.sleep(4)
-    # 确认注入成功
-    try:
-        success = page.run_js("""
-            return document.body.innerText.includes('Key saved') ||
-                   document.body.innerText.includes('key') ||
-                   document.body.innerText.includes('activated');
-        """)
-        if success:
-            log("  ✅ CDK 注入成功")
-        else:
-            log("  ⚠️ CDK 注入状态不确定，继续...")
-    except Exception:
-        pass
-    time.sleep(2)
+    time.sleep(5)
+    log("✅ CDK 注入完成")
     return True
 
 
@@ -344,22 +331,13 @@ def click_hcaptcha_checkbox(page):
 
 def handle_captcha(page, cdk, scene="page", max_attempts=3):
     """
-    hCaptcha 处理主流程：
-    1. 注入 CDK 到 NopeCHA 扩展（首次）
-    2. 等待扩展自动解
-    3. 兜底：点击复选框
+    hCaptcha 处理：等待 NopeCHA 扩展自动解题
+    扩展已在启动时通过 CDK 激活，这里只需要等待
     """
-    log(f"  → [{scene}] 处理 hCaptcha 验证")
+    log(f"  → [{scene}] 等待 hCaptcha 被扩展自动解决...")
 
-    # 注入 CDK 到扩展
-    if cdk:
-        inject_cdk_to_extension(page, cdk)
-        # 回到原页面
-        time.sleep(2)
-
-    # 等待扩展自动解
     for attempt in range(max_attempts):
-        log(f"  [{scene}] 等待扩展解题 ({attempt + 1}/{max_attempts})...")
+        log(f"  [{scene}] 等待中 ({attempt + 1}/{max_attempts})...")
         if wait_hcaptcha_solved(page, timeout=30):
             return True
         # 兜底：点击复选框
