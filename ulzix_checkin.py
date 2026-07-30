@@ -1080,6 +1080,10 @@ def main():
         _setup_dialog_handler(page)
 
         # ── Step 1: 从 Discord 领取当天 CDK ──
+        log("📂 打开 Discord 频道预热...")
+        page.get(DISCORD_CHANNEL_URL)
+        time.sleep(8)  # 给 Discord 充足的首次渲染时间
+
         cdk = ensure_cdk(page)
         if not cdk:
             fail_reason = "未能获取 CDK"
