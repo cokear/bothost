@@ -1295,7 +1295,7 @@ def main():
         # ── Step 1: 确保 CDK 有效并注入 ──────────────────
         log("📂 打开 Discord 频道...")
         page.get(DISCORD_CHANNEL_URL)
-        time.sleep(8)
+        time.sleep(20)
 
         cdk = ensure_cdk(page)
         if not cdk:
