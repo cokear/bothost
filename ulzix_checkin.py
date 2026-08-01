@@ -3,8 +3,7 @@
 """
 Ulzix 每日签到 (DrissionPage + NopeCHA)
 ────────────────────────────────────────
-- Discord 领取 NopeCHA CDK（每日动态）
-- CDK 直接作为 NopeCHA API Key 解 Cloudflare hCaptcha
+- 自动读取 NOPECHA_KEY 环境变量注入扩展（或使用现有配置）
 - DrissionPage 驱动浏览器
 - 自动登录 Ulzix + 签到 + 积分读取
 - Telegram 通知
@@ -25,10 +24,6 @@ PROFILE_DIR = os.getenv("BROWSER_USER_DATA_DIR",
 
 # NopeCHA 扩展目录（CDP 回退时备用）
 NOPECHA_EXT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium")
-
-# Discord（领取 CDK）
-DISCORD_CHANNEL_URL = "https://discord.com/channels/1046086326077882479/1243188924520726538"
-DISCORD_DM_URL      = "https://discord.com/channels/@me/1514785932203528202"
 
 # Ulzix
 LOGIN_URL  = "https://idc-new.ulzix.com/login"
@@ -75,7 +70,8 @@ def send_tg_screenshot(page, caption="debug"):
                 timeout=15,
             )
         log(f"📸 截图已推送 TG: {caption}")
-        os.remove(path)
+        if os.path.exists(path):
+            os.remove(path)
     except Exception as e:
         log(f"⚠️ 截图推送失败: {e}")
 
@@ -272,10 +268,10 @@ def inject_cdk_to_extension(page, cdk):
     """将 CDK 注入 NopeCHA 扩展（通过 setup 页面）"""
     if not cdk:
         return False
-    log(f"💉 注入 CDK 到 NopeCHA 扩展: {cdk[:4]}****{cdk[-4:]}")
+    log(f"💉 注入 API Key 到 NopeCHA 扩展: {cdk[:4]}****{cdk[-4:]}")
     page.get(f"https://nopecha.com/setup#{cdk}")
     time.sleep(5)
-    log("✅ CDK 注入完成")
+    log("✅ API Key 注入完成")
     return True
 
 
@@ -306,7 +302,6 @@ def wait_hcaptcha_solved(page, timeout=60):
 def click_hcaptcha_checkbox(page):
     """尝试点击 hCaptcha 复选框（扩展未自动解时的兜底）"""
     try:
-        # hCaptcha checkbox 通常在 iframe 里
         iframe = page.run_js("""
             var frames = document.querySelectorAll('iframe[src*="hcaptcha.com"]');
             for (var f of frames) {
@@ -327,10 +322,7 @@ def click_hcaptcha_checkbox(page):
 
 
 def handle_captcha(page, cdk, scene="page", max_attempts=3):
-    """
-    hCaptcha 处理：等待 NopeCHA 扩展自动解题
-    扩展已在启动时通过 CDK 激活，这里只需要等待
-    """
+    """hCaptcha 处理：等待 NopeCHA 扩展自动解题"""
     log(f"  → [{scene}] 等待 hCaptcha 被扩展自动解决...")
 
     for attempt in range(max_attempts):
@@ -346,395 +338,11 @@ def handle_captcha(page, cdk, scene="page", max_attempts=3):
 
 
 # ══════════════════════════════════════════════════════════
-# ── Discord CDK 领取流程 ────────────────────────────────
-# ══════════════════════════════════════════════════════════
-
-def get_page_text(page):
-    try:
-        return page.run_js("return document.body.innerText;") or ""
-    except Exception:
-        return ""
-
-
-def extract_latest_cdk(text):
-    pattern = re.findall(
-        r'Here is your Discord key for NopeCHA[:\s]+([a-z0-9]+).*?\(([^)]+)\)',
-        text, re.IGNORECASE | re.DOTALL,
-    )
-    if not pattern:
-        return "", False
-    cdk, time_label = pattern[-1]
-    is_recent = "内" in time_label
-    log(f"  📋 CDK 时间标记: {time_label} | 24h内: {is_recent}")
-    return cdk, is_recent
-
-
-def inject_nopecha_key(page, cdk):
-    """将 CDK 注入 NopeCHA 扩展（扩展回退方案使用）"""
-    log(f"💉 注入 key 到 NopeCHA 插件...")
-    page.get(f"https://nopecha.com/setup#{cdk}")
-    time.sleep(3)
-    log(f"✅ 插件注入完成: {cdk[:4]}****{cdk[-4:]}")
-
-
-def wait_dm_rendered(page, timeout=25):
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            ready = page.run_js("""
-                return !!document.querySelector(
-                    '[data-list-id="chat-messages"] li,'
-                    + 'li[id^="chat-messages"],'
-                    + '[class*="messageListItem"],'
-                    + '[class*="messageContent"]'
-                );
-            """)
-            if ready:
-                txt_len = page.run_js(
-                    "return (document.body.innerText || '').length;"
-                ) or 0
-                if txt_len > 80:
-                    return True
-        except Exception:
-            pass
-        time.sleep(1)
-    return False
-
-
-def read_dm_cdk(page, load_timeout=30):
-    """打开 Discord 私聊，读取最新 CDK"""
-    page.get(DISCORD_DM_URL)
-    rendered = wait_dm_rendered(page, timeout=load_timeout)
-    if not rendered:
-        log("  ⚠️ 私聊消息区未渲染完成")
-        return "", False, False
-
-    last_cdk = ""
-    for _ in range(3):
-        text = get_page_text(page)
-        cdk, is_recent = extract_latest_cdk(text) if text else ("", False)
-        if cdk and is_recent:
-            return cdk, True, True
-        if cdk:
-            last_cdk = cdk
-        time.sleep(1.5)
-    return last_cdk, False, True
-
-
-# ── Discord 频道消息框定位 ────────────────────────────────
-
-_FIND_CHANNEL_COMPOSER_JS = r"""
-() => {
-  function vis(el) {
-    if (!el) return false;
-    try {
-      var st = getComputedStyle(el);
-      if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
-      if (parseFloat(st.opacity || '1') < 0.05) return false;
-      var r = el.getBoundingClientRect();
-      return r.width > 40 && r.height > 12;
-    } catch (e) { return false; }
-  }
-  function labelOf(el) {
-    return ((el.getAttribute('aria-label') || '') + ' '
-      + (el.getAttribute('placeholder') || '') + ' '
-      + (el.getAttribute('data-placeholder') || '') + ' '
-      + (el.getAttribute('aria-placeholder') || '')).toLowerCase();
-  }
-  function isSearch(el) {
-    var lab = labelOf(el);
-    if (/search|搜索|查找/.test(lab) && !/message|消息|给 |发送/.test(lab))
-      return true;
-    try {
-      var r = el.getBoundingClientRect();
-      if (r.top < 120 && r.left > window.innerWidth * 0.35) {
-        if (/search|搜索/.test(lab) ||
-            el.closest('[class*="searchBar"],[class*="SearchBar"],form[role="search"]'))
-          return true;
-      }
-    } catch (e) {}
-    if (el.closest('[class*="searchBar"],[class*="SearchBar"],form[role="search"]'))
-      return true;
-    return false;
-  }
-  function isComposerLike(el) {
-    if (!vis(el) || isSearch(el)) return false;
-    var lab = labelOf(el);
-    if (/^message |^message#|message @|给 .* 发消息|发送消息到|chat input/i.test(lab))
-      return true;
-    if (/message|消息|发送|给 #|给 @/.test(lab) && !/search|搜索/.test(lab))
-      return true;
-    if (el.closest('[class*="channelTextArea"],[class*="ChannelTextArea"]')) {
-      var r = el.getBoundingClientRect();
-      if (r.top > window.innerHeight * 0.45) return true;
-    }
-    return false;
-  }
-  var nodes = Array.prototype.slice.call(document.querySelectorAll(
-    '[data-slate-editor="true"], div[role="textbox"][contenteditable="true"], div[role="textbox"]'
-  ));
-  var cands = nodes.filter(isComposerLike);
-  if (!cands.length) {
-    cands = nodes.filter(function(el) { return vis(el) && !isSearch(el); });
-  }
-  if (!cands.length) return null;
-  cands.sort(function(a, b) {
-    var ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-    return (rb.bottom - ra.bottom) || (rb.width - ra.width);
-  });
-  var el = cands[0];
-  var r = el.getBoundingClientRect();
-  document.querySelectorAll('[data-earn-composer="1"]').forEach(function(x) {
-    try { x.removeAttribute('data-earn-composer'); } catch (e) {}
-  });
-  el.setAttribute('data-earn-composer', '1');
-  return {
-    top: r.top, left: r.left, width: r.width, height: r.height,
-    bottom: r.bottom,
-    label: (el.getAttribute('aria-label') || '').slice(0, 80)
-  };
-}
-"""
-
-
-def _channel_composer_info(page):
-    try:
-        info = page.run_js(
-            "return (%s)();" % _FIND_CHANNEL_COMPOSER_JS.lstrip()
-        )
-        if isinstance(info, dict) and info.get("width"):
-            return info
-    except Exception as e:
-        log(f"  ⚠️ 定位频道输入框失败: {e}")
-    return None
-
-
-def _composer_text(page):
-    try:
-        return page.run_js("""
-            var el = document.querySelector('[data-earn-composer="1"]')
-                  || document.querySelector(
-                       '[class*="channelTextArea"] [data-slate-editor="true"]')
-                  || document.querySelector(
-                       '[class*="channelTextArea"] [role="textbox"]');
-            if (!el) return '';
-            return ((el.innerText || el.textContent || '') + '').trim();
-        """) or ""
-    except Exception:
-        return ""
-
-
-def _focus_channel_composer(page):
-    info = _channel_composer_info(page)
-    if not info:
-        return None
-    try:
-        cx = int(info["left"] + info["width"] / 2)
-        cy = int(info["top"] + min(info["height"] / 2, 18))
-        _cdp_click(page, cx, cy)
-    except Exception:
-        pass
-    try:
-        page.run_js("""
-            var el = document.querySelector('[data-earn-composer="1"]');
-            if (!el) return false;
-            el.scrollIntoView({block:'center'});
-            try { el.click(); } catch (e) {}
-            try { el.focus(); } catch (e) {}
-            var inner = el.querySelector(
-              '[data-slate-node="element"], [contenteditable="true"]') || el;
-            try { inner.focus(); } catch (e2) {}
-            return true;
-        """)
-    except Exception:
-        pass
-    time.sleep(0.35)
-    return info
-
-
-def wait_channel_input_ready(page, timeout=30):
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            info = _channel_composer_info(page)
-            if info and info.get("bottom", 0) > 100:
-                vh = page.run_js("return window.innerHeight;") or 800
-                if info.get("top", 0) > vh * 0.35:
-                    log(f"  ✓ 频道输入框就绪 label={info.get('label')!r}")
-                    return True
-                if (info.get("top", 0) > 150
-                        and not re.search(
-                            r"search|搜索", str(info.get("label") or ""), re.I)):
-                    log(f"  ✓ 频道输入框就绪(宽松) label={info.get('label')!r}")
-                    return True
-        except Exception:
-            pass
-        time.sleep(1)
-    return False
-
-
-def type_command_verified(page, cmd="!nopecha", retries=3):
-    for i in range(retries):
-        log(f"  → 输入命令尝试 {i+1}/{retries}...")
-        # Esc 清除可能的搜索焦点
-        try:
-            for ev_type in ["keyDown", "keyUp"]:
-                page.run_cdp(
-                    "Input.dispatchKeyEvent",
-                    type=ev_type, key="Escape", code="Escape",
-                    windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
-                )
-        except Exception:
-            pass
-        time.sleep(0.25)
-
-        info = _focus_channel_composer(page)
-        if not info:
-            log("  ⚠️ 未找到频道底部消息输入框")
-            time.sleep(2)
-            continue
-        lab = str(info.get("label") or "")
-        if (re.search(r"search|搜索", lab, re.I)
-                and not re.search(r"message|消息", lab, re.I)):
-            log(f"  ⚠️ 疑似搜索框 label={lab!r}，重试...")
-            time.sleep(1)
-            continue
-
-        # 清空残留
-        try:
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown",
-                         key="a", code="KeyA", modifiers=2)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp",
-                         key="a", code="KeyA", modifiers=2)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown",
-                         key="Backspace", code="Backspace",
-                         windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp",
-                         key="Backspace", code="Backspace",
-                         windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
-        except Exception:
-            pass
-        time.sleep(0.3)
-
-        _focus_channel_composer(page)
-        try:
-            page.run_cdp("Input.insertText", text=cmd)
-        except Exception as e:
-            log(f"  ⚠️ insertText 失败: {e}")
-        time.sleep(random.uniform(0.5, 0.9))
-
-        cur = _composer_text(page)
-        log(f"  消息框内容: '{cur}'")
-
-        if cmd.strip() not in cur:
-            log("  ⚠️ 消息框未获取到命令，重试...")
-            time.sleep(2)
-            continue
-
-        # 回车发送
-        try:
-            page.run_cdp(
-                "Input.dispatchKeyEvent", type="keyDown", key="Enter",
-                code="Enter", windowsVirtualKeyCode=13,
-                nativeVirtualKeyCode=13, text="\r",
-            )
-            page.run_cdp(
-                "Input.dispatchKeyEvent", type="keyUp", key="Enter",
-                code="Enter", windowsVirtualKeyCode=13,
-                nativeVirtualKeyCode=13,
-            )
-        except Exception:
-            pass
-        time.sleep(1.5)
-
-        after = _composer_text(page)
-        if cmd.strip() not in after:
-            log("  ✅ 命令已成功发送")
-            return True
-        log("  ⚠️ 回车后消息框仍有内容，重试...")
-        time.sleep(2)
-    return False
-
-
-def send_command_and_poll(page):
-    """去频道发 !nopecha，轮询私聊等 CDK 回复"""
-    page.get(DISCORD_CHANNEL_URL)
-    log("⏳ 等待频道输入框就绪...")
-    if not wait_channel_input_ready(page, timeout=30):
-        log("❌ 频道输入框超时")
-        return ""
-    wait_dm_rendered(page, timeout=15)
-
-    log("⌨️ 发送 !nopecha 命令...")
-    if not type_command_verified(page, "!nopecha", retries=3):
-        log("❌ !nopecha 发送失败")
-        return ""
-
-    log("✅ 命令已发送，等待私聊回复...")
-    time.sleep(5)
-
-    for attempt in range(20):
-        log(f"  [{attempt+1}/20] 打开私聊检查 CDK...")
-        cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=30)
-        if cdk and is_recent:
-            log(f"✅ 获取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
-            return cdk
-        if not rendered:
-            log("  ⏳ 私聊未加载完成，稍后重试...")
-        page.get(DISCORD_CHANNEL_URL)
-        time.sleep(4)
-    return ""
-
-
-def ensure_cdk(page):
-    """
-    CDK 领取主逻辑：
-    1. 先查私聊是否已有 24h 内的 CDK
-    2. 没有就去频道发 !nopecha 领新的
-    返回: 当天的 CDK（直接用作 NopeCHA API Key）
-    """
-    log("=" * 50)
-    log("🔑 CDK 检查流程")
-    log("=" * 50)
-
-    if "login" in (page.url or "").lower():
-        log("❌ Discord 登录态失效")
-        send_tg("❌ Discord 登录态失效，请重新初始化 Profile")
-        return ""
-
-    # 查私聊
-    log("🔍 检查私聊是否已有24h内的 CDK...")
-    cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=40)
-    if cdk and is_recent:
-        log(f"✅ 已有24h内 CDK: {cdk[:4]}****{cdk[-4:]}")
-        return cdk
-
-    # 慢网重试
-    if not rendered:
-        for i in range(2):
-            log(f"  🔁 私聊未加载完成，重试 ({i+1}/2)...")
-            cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=40)
-            if cdk and is_recent:
-                log(f"✅ 重试读到 CDK: {cdk[:4]}****{cdk[-4:]}")
-                return cdk
-            if rendered:
-                break
-
-    # 领新的
-    log("📭 无有效 CDK，去频道领取...")
-    cdk = send_command_and_poll(page)
-    if not cdk:
-        log("❌ 未能获取 CDK")
-        send_tg("❌ 未能获取 NopeCHA CDK，请检查 Discord")
-    return cdk
-
-
-# ══════════════════════════════════════════════════════════
 # ── Ulzix 登录 ──────────────────────────────────────────
 # ══════════════════════════════════════════════════════════
 
 def ulzix_login(page, email, password, cdk):
-    """邮箱密码登录 Ulzix（可能触发 hCaptcha，用 CDK 解）"""
+    """邮箱密码登录 Ulzix（可能触发 hCaptcha，用扩展解）"""
     log("🔐 登录 Ulzix...")
     page.get(LOGIN_URL)
     time.sleep(5)
@@ -897,10 +505,7 @@ def is_signed(html):
 
 
 def do_signin(page, cdk):
-    """
-    打开签到页 → 解 hCaptcha → 点签到 → 确认结果
-    cdk = 当天 CDK，用于 NopeCHA API 解 hCaptcha
-    """
+    """打开签到页 → 自动解 hCaptcha → 点签到 → 确认结果"""
     log("📝 打开签到页...")
     page.get(SIGNIN_URL)
     _setup_dialog_handler(page)
@@ -937,9 +542,9 @@ def do_signin(page, cdk):
         log("  🔍 检测到验证码（CF/hCaptcha），尝试解决...")
         handle_captcha(page, cdk, "signin_page2")
 
-    # 再次确认 hCaptcha 已解决（签到按钮可能要求先验证）
+    # 再次确认 hCaptcha 已解决
     if _is_hcaptcha_page(page):
-        log("  🔍 hCaptcha 仍存在，强制调用 NopeCHA API...")
+        log("  🔍 hCaptcha 仍存在，强制等待解决...")
         handle_captcha(page, cdk, "signin_before_click", max_attempts=5)
 
     # 检查签到按钮
@@ -1028,6 +633,7 @@ def main():
     tg_token = os.getenv("TG_BOT_TOKEN")
     tg_chat_id = os.getenv("TG_CHAT_ID")
     account_raw = os.getenv("ACCOUNTS")
+    
     if not account_raw:
         log("❌ 缺少 ACCOUNTS 环境变量（邮箱:密码）")
         return False
@@ -1079,23 +685,15 @@ def main():
         # 提前注册弹窗处理器
         _setup_dialog_handler(page)
 
-        # ── Step 1: 从 Discord 领取当天 CDK ──
-        log("📂 打开 Discord 频道预热...")
-        page.get(DISCORD_CHANNEL_URL)
-        time.sleep(20)  # 给 Discord 充足的首次渲染时间
+        # ── 检查环境变量中的 API Key 并注入 ──
+        cdk = os.getenv("NOPECHA_KEY", "")
+        if cdk:
+            log(f"🔑 检测到环境变量 NOPECHA_KEY，准备注入扩展...")
+            inject_cdk_to_extension(page, cdk)
+        else:
+            log("ℹ️ 未检测到 NOPECHA_KEY 环境变量，假设浏览器配置中已填写 API Key")
 
-        cdk = ensure_cdk(page)
-        if not cdk:
-            fail_reason = "未能获取 CDK"
-            send_tg(f"❌ 无法获取 NopeCHA CDK，签到终止")
-            return False
-
-        log(f"🔑 当天 CDK: {cdk[:4]}****{cdk[-4:]}")
-
-        # ── 注入 CDK 到 NopeCHA 扩展（一次性）──
-        inject_cdk_to_extension(page, cdk)
-
-        # ── Step 2: 登录 Ulzix ──
+        # ── Step 1: 登录 Ulzix ──
         ok, reason = ulzix_login(page, email, password, cdk)
         if not ok:
             fail_reason = reason
@@ -1103,7 +701,7 @@ def main():
             send_tg(build_result_caption(email, "登录失败", fail_reason=reason))
             return False
 
-        # ── Step 3: 签到 ──
+        # ── Step 2: 签到 ──
         success, result_text, before_points, current_points, fail_reason = \
             do_signin(page, cdk)
 
