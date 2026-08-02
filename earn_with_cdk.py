@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot-Hosting 金币自动领取 (DrissionPage 版)
-- Discord 获取 NopeCHA CDK → 注入插件
+Bot-Hosting 金币自动领取 (DrissionPage 版) - 纯净版
 - Discord OAuth 登录 Bot-Hosting（替代 token 注入，免过期）
 - Bot-Hosting 自动领取金币
 - Cloudflare Turnstile 自动处理 (CDP)
@@ -20,9 +19,6 @@ PROXY_URL       = os.getenv("BROWSER_PROXY", "")
 PROFILE_DIR     = os.getenv("BROWSER_USER_DATA_DIR",
                             os.path.expanduser("~/.chrome-profile-discord"))
 NOPECHA_EXT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chromium")
-
-DISCORD_CHANNEL_URL = "https://discord.com/channels/1046086326077882479/1243188924520726538"
-DISCORD_DM_URL      = "https://discord.com/channels/@me/1514785932203528202"
 
 TARGET_URL = "https://legacy.bot-hosting.net/panel/"
 EARN_URL   = "https://legacy.bot-hosting.net/panel/earn"
@@ -365,536 +361,10 @@ def get_total_coins(page):
     return "未知"
 
 
-# ── CDK 提取 ─────────────────────────────────────────────
-
-def extract_latest_cdk(text):
-    pattern = re.findall(
-        r'Here is your Discord key for NopeCHA[:\s]+([a-z0-9]+).*?\(([^)]+)\)',
-        text, re.IGNORECASE | re.DOTALL
-    )
-    if not pattern:
-        return '', False
-
-    cdk, time_label = pattern[-1]
-    is_recent = '内' in time_label
-    log(f"  📋 最新 CDK 时间标记: {time_label} | 24h内: {is_recent}")
-    return cdk, is_recent
-
-
-# ── 注入 key 到插件 ───────────────────────────────────────
-
-def inject_nopecha_key(page, cdk):
-    log(f"💉 注入 key 到 NopeCHA 插件...")
-    page.get(f"https://nopecha.com/setup#{cdk}")
-    time.sleep(3)
-    log(f"✅ key 注入完成: {cdk[:4]}****{cdk[-4:]}")
-
-
-# ── 获取元素屏幕坐标（Discord 用）──────────────────────
-
-def get_element_screen_pos(page, selector):
-    try:
-        info = page.run_js(f"""
-            var el = document.querySelector('{selector}');
-            if (!el) return null;
-            var r = el.getBoundingClientRect();
-            return {{
-                cx: r.left + r.width / 2,
-                cy: r.top + r.height / 2,
-                sx: window.screenX || 0,
-                sy: window.screenY || 0,
-                dh: window.outerHeight - window.innerHeight,
-                dw: (window.outerWidth - window.innerWidth) / 2
-            }};
-        """)
-        if not info:
-            return None, None
-        ox = int(info.get('sx', 0) + info.get('dw', 0))
-        oy = int(info.get('sy', 0) + info.get('dh', 0))
-        return int(info['cx']) + ox, int(info['cy']) + oy
-    except:
-        return None, None
-
-
-# ── xdotool 点击（Discord 输入用）────────────────────────
-
-def xdo_click(page, x, y, label=""):
-    try:
-        wi = page.run_js("""
-            return {
-                sx: window.screenX || 0,
-                sy: window.screenY || 0,
-                oh: window.outerHeight,
-                ih: window.innerHeight
-            };
-        """) or {"sx": 0, "sy": 0, "oh": 1080, "ih": 900}
-        bar = wi.get("oh", 1080) - wi.get("ih", 900)
-        if bar < 0 or bar > 200:
-            bar = 85
-        ax = int(x + wi.get("sx", 0))
-        ay = int(y + wi.get("sy", 0) + bar)
-        os.system(f"xdotool mousemove --sync {ax} {ay}")
-        time.sleep(0.2)
-        os.system("xdotool click 1")
-        if label:
-            log(f"  🖱️ 点击 ({ax},{ay}) {label}")
-        return True
-    except Exception as e:
-        log(f"  ⚠️ xdotool 点击失败: {e}")
-        return False
-
-
-def keyboard_type(text):
-    for ch in text:
-        os.system(f'xdotool type --clearmodifiers --delay 80 -- "{ch}"')
-        time.sleep(random.uniform(0.05, 0.15))
-
-
-def keyboard_key(key):
-    os.system(f"xdotool key --clearmodifiers {key}")
-    time.sleep(0.1)
-
-
-# ── 等 Discord 消息区真正渲染出来（内容驱动，抗慢网）──────
-
-def wait_dm_rendered(page, timeout=25):
-    """
-    轮询直到聊天消息节点出现且正文有一定长度。
-    返回 True 表示消息区确实渲染完成；False 表示超时内未加载出来。
-    """
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            ready = page.run_js("""
-                return !!document.querySelector(
-                    '[data-list-id="chat-messages"] li,'
-                    + 'li[id^="chat-messages"],'
-                    + '[class*="messageListItem"],'
-                    + '[class*="messageContent"]'
-                );
-            """)
-            if ready:
-                txt_len = page.run_js("return (document.body.innerText || '').length;") or 0
-                if txt_len > 80:
-                    return True
-        except:
-            pass
-        time.sleep(1)
-    return False
-
-
-# ── 打开私聊并轮询读取 CDK（区分「没加载」与「没有CDK」）──────
-
-def read_dm_cdk(page, load_timeout=30):
-    """
-    打开 Discord 私聊并稳健读取 CDK。
-    返回 (cdk, is_recent, rendered):
-      - rendered=True  表示消息区确实渲染完成（可信地判断有无 CDK）
-      - rendered=False 表示超时内页面没加载完（网络慢，不应据此判定"没有 CDK"）
-    """
-    page.get(DISCORD_DM_URL)
-
-    rendered = wait_dm_rendered(page, timeout=load_timeout)
-    if not rendered:
-        log("  ⚠️ 私聊消息区在超时内未渲染完成（可能网络慢）")
-        return '', False, False
-
-    # 已渲染，但懒加载可能还差最后一帧 → 多读几轮取稳定结果
-    last_cdk = ''
-    for _ in range(3):
-        text = get_page_text(page)
-        cdk, is_recent = extract_latest_cdk(text) if text else ('', False)
-        if cdk and is_recent:
-            return cdk, True, True
-        if cdk:
-            last_cdk = cdk
-        time.sleep(1.5)
-
-    # 消息区已渲染完成但没有 24h 内的 CDK → 确实没有
-    return last_cdk, False, True
-
-
-# ── 频道底部「发消息」输入框（绝不能点到右上角搜索）────────
-
-# Discord 里有多处 slate / textbox：右上角 Search、成员搜索、频道消息框。
-# 旧逻辑 querySelector('[data-slate-editor=true]') 常命中搜索栏。
-_FIND_CHANNEL_COMPOSER_JS = r"""
-() => {
-  function vis(el) {
-    if (!el) return false;
-    try {
-      var st = getComputedStyle(el);
-      if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
-      if (parseFloat(st.opacity || '1') < 0.05) return false;
-      var r = el.getBoundingClientRect();
-      return r.width > 40 && r.height > 12;
-    } catch (e) { return false; }
-  }
-  function labelOf(el) {
-    return ((el.getAttribute('aria-label') || '') + ' '
-      + (el.getAttribute('placeholder') || '') + ' '
-      + (el.getAttribute('data-placeholder') || '') + ' '
-      + (el.getAttribute('aria-placeholder') || '')).toLowerCase();
-  }
-  function isSearch(el) {
-    var lab = labelOf(el);
-    if (/search|搜索|查找/.test(lab) && !/message|消息|给 |发送/.test(lab)) return true;
-    // 右上角搜索：一般在视口上半且偏右
-    try {
-      var r = el.getBoundingClientRect();
-      if (r.top < 120 && r.left > window.innerWidth * 0.35) {
-        if (/search|搜索/.test(lab) || el.closest('[class*="searchBar"],[class*="SearchBar"],form[role="search"]'))
-          return true;
-      }
-    } catch (e) {}
-    if (el.closest('[class*="searchBar"],[class*="SearchBar"],[class*="search-bar"],form[role="search"]'))
-      return true;
-    return false;
-  }
-  function isComposerLike(el) {
-    if (!vis(el) || isSearch(el)) return false;
-    var lab = labelOf(el);
-    // 明确的消息框文案
-    if (/^message |^message#|message @|给 .* 发消息|发送消息到|在 .* 中发送|write.*message|chat input/i.test(lab))
-      return true;
-    if (/message|消息|发送|给 #|给 @/.test(lab) && !/search|搜索/.test(lab))
-      return true;
-    // 结构：在 channelTextArea / form 底部区域
-    if (el.closest('[class*="channelTextArea"],[class*="ChannelTextArea"],form[class*="form"]')) {
-      var r = el.getBoundingClientRect();
-      if (r.top > window.innerHeight * 0.45) return true;
-    }
-    return false;
-  }
-  var nodes = Array.prototype.slice.call(document.querySelectorAll(
-    '[data-slate-editor="true"], div[role="textbox"][contenteditable="true"], div[role="textbox"]'
-  ));
-  var cands = nodes.filter(isComposerLike);
-  if (!cands.length) {
-    // 退路：所有可见 textbox/slate，排除搜索，取最靠视口底部的
-    cands = nodes.filter(function(el) {
-      return vis(el) && !isSearch(el);
-    });
-  }
-  if (!cands.length) return null;
-  cands.sort(function(a, b) {
-    var ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-    // 更靠下优先，其次更宽
-    return (rb.bottom - ra.bottom) || (rb.width - ra.width);
-  });
-  var el = cands[0];
-  var r = el.getBoundingClientRect();
-  // 打标，后续读写用同一节点
-  document.querySelectorAll('[data-earn-composer="1"]').forEach(function(x) {
-    try { x.removeAttribute('data-earn-composer'); } catch (e) {}
-  });
-  el.setAttribute('data-earn-composer', '1');
-  return {
-    top: r.top, left: r.left, width: r.width, height: r.height,
-    bottom: r.bottom,
-    label: (el.getAttribute('aria-label') || '').slice(0, 80),
-    text: ((el.innerText || el.textContent || '') + '').trim().slice(0, 80)
-  };
-}
-"""
-
-
-def _channel_composer_info(page):
-    """定位频道底部发消息框；排除右上角 Search。"""
-    try:
-        # run_js 既可传函数体也可传 IIFE；统一用表达式调用
-        info = page.run_js("return (%s)();" % _FIND_CHANNEL_COMPOSER_JS.lstrip())
-        if isinstance(info, dict) and info.get("width"):
-            return info
-    except Exception as e:
-        log(f"  ⚠️ 定位频道输入框失败: {e}")
-    return None
-
-
-def _composer_text(page):
-    try:
-        return page.run_js("""
-            var el = document.querySelector('[data-earn-composer="1"]')
-                  || document.querySelector('[class*="channelTextArea"] [data-slate-editor="true"]')
-                  || document.querySelector('[class*="channelTextArea"] [role="textbox"]');
-            if (!el) return '';
-            return ((el.innerText || el.textContent || '') + '').trim();
-        """) or ""
-    except Exception:
-        return ""
-
-
-def _focus_channel_composer(page):
-    """点击并 focus 频道消息框（非搜索栏）。成功返回 info dict。"""
-    info = _channel_composer_info(page)
-    if not info:
-        return None
-    # 点中心，确保 focus 进 contenteditable
-    try:
-        cx = int(info["left"] + info["width"] / 2)
-        cy = int(info["top"] + min(info["height"] / 2, 18))
-        _cdp_click(page, cx, cy)
-    except Exception:
-        pass
-    try:
-        page.run_js("""
-            var el = document.querySelector('[data-earn-composer="1"]');
-            if (!el) return false;
-            el.scrollIntoView({block:'center'});
-            try { el.click(); } catch (e) {}
-            try { el.focus(); } catch (e) {}
-            // 再点内部可编辑子节点
-            var inner = el.querySelector('[data-slate-node="element"], [contenteditable="true"]') || el;
-            try { inner.focus(); } catch (e2) {}
-            return true;
-        """)
-    except Exception:
-        pass
-    time.sleep(0.35)
-    return info
-
-
-def wait_channel_input_ready(page, timeout=30):
-    """轮询直到频道底部「发消息」框就绪（不是右上角搜索）。"""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            info = _channel_composer_info(page)
-            if info and info.get("bottom", 0) > 100:
-                # 必须在偏下半屏，避免搜索栏误判
-                if info.get("top", 0) > (page.run_js("return window.innerHeight;") or 800) * 0.35:
-                    log(f"  ✓ 频道输入框就绪 label={info.get('label')!r} top={info.get('top'):.0f}")
-                    return True
-                # 有的小窗 top 也可能偏中，只要不是搜索且靠下即可
-                if info.get("top", 0) > 150 and not re.search(r"search|搜索", str(info.get("label") or ""), re.I):
-                    log(f"  ✓ 频道输入框就绪(宽松) label={info.get('label')!r} top={info.get('top'):.0f}")
-                    return True
-        except Exception:
-            pass
-        time.sleep(1)
-    return False
-
-
-# ── 输入并验证命令确实发出去了 ────────────────────────────
-
-def type_command_verified(page, cmd="!nopecha", retries=3):
-    """
-    聚焦【频道底部消息框】→ CDP 注入文本 → 校验 → 回车发送。
-
-    禁止用全局 [data-slate-editor]：Discord 右上角搜索也是同类控件，
-    querySelector 第一个常点到 Search（截图复现：命令进了搜索栏）。
-    """
-    for i in range(retries):
-        log(f"  → 输入命令尝试 {i+1}/{retries}...")
-
-        # 0) 若焦点还在搜索栏，先 Esc 关掉搜索 UI
-        try:
-            page.run_cdp(
-                "Input.dispatchKeyEvent",
-                type="keyDown", key="Escape", code="Escape",
-                windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
-            )
-            page.run_cdp(
-                "Input.dispatchKeyEvent",
-                type="keyUp", key="Escape", code="Escape",
-                windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
-            )
-        except Exception:
-            pass
-        time.sleep(0.25)
-
-        info = _focus_channel_composer(page)
-        if not info:
-            log("  ⚠️ 未找到频道底部消息输入框（可能仍在加载）")
-            time.sleep(2)
-            continue
-        lab = str(info.get("label") or "")
-        if re.search(r"search|搜索", lab, re.I) and not re.search(r"message|消息", lab, re.I):
-            log(f"  ⚠️ 仍疑似搜索框 label={lab!r}，重试定位...")
-            time.sleep(1)
-            continue
-        log(f"  定位消息框: label={lab!r} top={info.get('top'):.0f}")
-
-        # 清空残留（在已 focus 的 composer 上）
-        try:
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="a",
-                         code="KeyA", modifiers=2)  # Ctrl+A
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="a",
-                         code="KeyA", modifiers=2)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Backspace",
-                         code="Backspace", windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Backspace",
-                         code="Backspace", windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
-        except Exception:
-            pass
-        time.sleep(0.3)
-
-        # 再 focus 一次再插入，避免焦点跳回搜索
-        _focus_channel_composer(page)
-        try:
-            page.run_cdp("Input.insertText", text=cmd)
-        except Exception as e:
-            log(f"  ⚠️ insertText 失败，尝试键盘输入兜底: {e}")
-            keyboard_type(cmd)
-        time.sleep(random.uniform(0.5, 0.9))
-
-        cur = _composer_text(page)
-        log(f"  当前消息框内容: '{cur}'")
-
-        # 若文本跑进了搜索栏，composer 会是空的或没有命令
-        if cmd.strip() not in cur:
-            # 探测搜索栏是否吃了文本
-            try:
-                search_txt = page.run_js("""
-                    var s = document.querySelector(
-                      'input[aria-label*="Search" i], input[aria-label*="搜索"],'
-                      + '[class*="searchBar"] input, [class*="SearchBar"] input,'
-                      + 'form[role="search"] input, [aria-label*="Search" i][role="combobox"]'
-                    );
-                    if (!s) {
-                      var boxes = document.querySelectorAll('[data-slate-editor="true"], [role="textbox"]');
-                      for (var i=0;i<boxes.length;i++){
-                        var lab=((boxes[i].getAttribute('aria-label')||'')+'').toLowerCase();
-                        var r=boxes[i].getBoundingClientRect();
-                        if ((/search|搜索/.test(lab) || r.top<120) && r.left>window.innerWidth*0.3)
-                          return ((boxes[i].innerText||boxes[i].textContent||boxes[i].value||'')+'').trim();
-                      }
-                      return '';
-                    }
-                    return ((s.value||s.innerText||s.textContent||'')+'').trim();
-                """) or ""
-            except Exception:
-                search_txt = ""
-            if cmd.strip() in str(search_txt):
-                log(f"  ⚠️ 命令误入搜索栏: '{search_txt}' — 清空搜索并重试")
-                try:
-                    page.run_cdp(
-                        "Input.dispatchKeyEvent", type="keyDown", key="Escape",
-                        code="Escape", windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
-                    )
-                    page.run_cdp(
-                        "Input.dispatchKeyEvent", type="keyUp", key="Escape",
-                        code="Escape", windowsVirtualKeyCode=27, nativeVirtualKeyCode=27,
-                    )
-                except Exception:
-                    pass
-            else:
-                log("  ⚠️ 消息框仍未获取到命令文本，重试...")
-            time.sleep(2)
-            continue
-
-        # 回车发送
-        try:
-            page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key="Enter",
-                         code="Enter", windowsVirtualKeyCode=13, nativeVirtualKeyCode=13, text="\r")
-            page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key="Enter",
-                         code="Enter", windowsVirtualKeyCode=13, nativeVirtualKeyCode=13)
-        except Exception as e:
-            log(f"  ⚠️ CDP 回车失败，尝试键盘兜底: {e}")
-            keyboard_key("Return")
-        time.sleep(1.5)
-
-        after = _composer_text(page)
-        if cmd.strip() not in after:
-            log("  ✅ 命令已成功发送（消息框已清空）")
-            return True
-
-        log("  ⚠️ 回车后消息框仍有内容，可能未发送，重试...")
-        time.sleep(2)
-
-    return False
-
-
-# ── 发送命令并轮询 CDK ────────────────────────────────────
-
-def send_command_and_poll(page):
-    page.get(DISCORD_CHANNEL_URL)
-
-    # 关键修复：先等频道输入框真正就绪，页面没加载好绝不敲命令
-    log("⏳ 等待频道输入框就绪...")
-    if not wait_channel_input_ready(page, timeout=30):
-        log("❌ 频道输入框超时未就绪（页面没加载好），本轮放弃发送")
-        return ''
-    # 再确认消息区渲染，避免 slash-command 面板等干扰
-    wait_dm_rendered(page, timeout=15)
-
-    log("⌨️ 发送 !nopecha 命令（带验证）...")
-    if not type_command_verified(page, "!nopecha", retries=3):
-        log("❌ !nopecha 命令发送失败（输入框/页面未就绪）")
-        return ''
-
-    log("✅ 命令已发送，等待私聊回复...")
-    time.sleep(5)
-
-    for attempt in range(20):
-        log(f"  [{attempt+1}/20] 打开私聊检查新 CDK...")
-
-        # 内容驱动读取：慢网会等到真正渲染完再判断
-        cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=30)
-        if cdk and is_recent:
-            log(f"✅ 提取到有效 CDK: {cdk[:4]}****{cdk[-4:]}")
-            return cdk
-
-        if not rendered:
-            log("  ⏳ 私聊未加载完成，稍后重试（不判定为无 CDK）...")
-
-        # 未拿到有效 CDK → 回频道等 bot 私聊回复
-        page.get(DISCORD_CHANNEL_URL)
-        time.sleep(4)
-
-    return ''
-
-
-# ── CDK 获取主逻辑 ────────────────────────────────────────
-
-def ensure_cdk(page):
-    log("=" * 50)
-    log("🔑 开始 CDK 检查流程")
-    log("=" * 50)
-
-    if "login" in (page.url or "").lower():
-        msg = "❌ Discord 登录态失效，请重新初始化 Profile"
-        log(msg)
-        send_tg(msg)
-        return ''
-
-    log("🔍 检查私聊是否已有24h内的 CDK...")
-    cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=40)
-
-    if cdk and is_recent:
-        log(f"✅ 已有24h内的 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
-        inject_nopecha_key(page, cdk)
-        return cdk
-
-    # 关键修复：私聊没加载完时不要立刻当成"没有 CDK"去重发命令，先重试读取
-    if not rendered:
-        for i in range(2):
-            log(f"  🔁 私聊未加载完成，重试读取 ({i+1}/2)...")
-            cdk, is_recent, rendered = read_dm_cdk(page, load_timeout=40)
-            if cdk and is_recent:
-                log(f"✅ 重试读到24h内 CDK，直接注入: {cdk[:4]}****{cdk[-4:]}")
-                inject_nopecha_key(page, cdk)
-                return cdk
-            if rendered:
-                break
-
-    log("📭 无24h内的 CDK，去频道发送命令领取新的...")
-    cdk = send_command_and_poll(page)
-
-    if not cdk:
-        msg = "❌ 未能获取 CDK，请检查 Discord"
-        log(msg)
-        send_tg(msg)
-        return ''
-
-    inject_nopecha_key(page, cdk)
-    return cdk
-
-
-# ── Discord OAuth 登录 bot-hosting（新增，替代 token 注入）──
+# ── Discord OAuth 登录 bot-hosting ──────────────────────
 
 def is_logged_in(page):
-    """已登录 bot-hosting 面板判定：当前域名是 bot-hosting、不在 /login，且有 token / 面板内容"""
+    """已登录 bot-hosting 面板判定"""
     host = (page.run_js("return location.hostname || '';") or '').lower()
     path = (page.run_js("return location.pathname || '';") or '').lower()
     if 'bot-hosting.net' not in host:
@@ -906,7 +376,6 @@ def is_logged_in(page):
             return True
     except:
         pass
-    # 兜底：在 panel 页且有实际内容
     if '/panel' in path:
         return _page_has_content(page)
     return False
@@ -964,34 +433,9 @@ def _click_authorize_btn(page):
         log("  ⏳ 授权按钮 disabled，等待...")
         return False
     if rect.get('w', 0) > 10:
-        _cdp_click(page, int(rect['x']), int(rect['y']))   # CDP 真实鼠标事件（trusted）
-    page.run_js(finder + " if (target) target.click();")     # JS 双保险
+        _cdp_click(page, int(rect['x']), int(rect['y']))
+    page.run_js(finder + " if (target) target.click();")
     return True
-
-
-def click_discord_authorize(page, timeout=60):
-    """在 Discord OAuth 页滚动权限列表并点「授权」。若已跳回 bot-hosting 则直接成功。"""
-    start = time.time()
-    clicked_once = False
-    while time.time() - start < timeout:
-        host = (page.run_js("return location.hostname || '';") or '').lower()
-        path = (page.run_js("return location.pathname || '';") or '').lower()
-
-        if 'bot-hosting.net' in host and '/login' not in path:
-            log("  ✅ 已跳回 bot-hosting（OAuth 完成）")
-            return True
-
-        if 'discord.com' in host and 'oauth2/authorize' in path:
-            _scroll_discord_permissions(page)
-            time.sleep(1.5)
-            if _click_authorize_btn(page) and not clicked_once:
-                log("  🖱️ 已点击 Discord「授权」按钮（滚动+CDP+JS）")
-                clicked_once = True
-            time.sleep(3)
-        time.sleep(1.5)
-
-    log("  ⚠️ 等待 Discord 授权/跳转超时")
-    return False
 
 
 def login_with_discord(page):
@@ -1012,7 +456,6 @@ def login_with_discord(page):
     page.get(LOGIN_URL)
     time.sleep(4)
 
-    # 参考可用脚本的思路：authorized_seen 标志 + 轮询；授权页判断放前面避免误判
     authorized_seen = False
     for _ in range(25):
         host = (page.run_js("return location.hostname || '';") or '').lower()
@@ -1070,13 +513,12 @@ def force_close_all_modals(page):
         pass
 
 
-# ── 处理弹窗并解析进度（唯一改动：用 JS 读弹窗文字）────
+# ── 处理弹窗并解析进度 ────────────────────────────────────
 
 def close_all_modals(page):
     claimed, total = None, None
     try:
         log("  → 等待成功弹窗...")
-        # 等待弹窗出现
         for _ in range(15):
             has_modal = page.run_js("return !!document.querySelector('.swal-modal');")
             if has_modal:
@@ -1084,7 +526,6 @@ def close_all_modals(page):
             time.sleep(1)
         time.sleep(1.5)
 
-        # 用 JS 读取弹窗内容（比 ele().text 更可靠）
         try:
             title = page.run_js("var el = document.querySelector('.swal-title'); return el ? el.innerText.trim() : '';") or ""
             text  = page.run_js("var el = document.querySelector('.swal-text'); return el ? el.innerText.trim() : '';") or ""
@@ -1097,7 +538,6 @@ def close_all_modals(page):
         except Exception as e:
             log(f"  ⚠️ 解析弹窗文本失败: {e}")
 
-        # 点击 OK
         try:
             page.run_js("var btn = document.querySelector('button.swal-button.swal-button--confirm'); if(btn) btn.click();")
             log("  ✓ 已点击 OK")
@@ -1105,14 +545,12 @@ def close_all_modals(page):
         except:
             pass
 
-        # 等待弹窗消失
         for _ in range(10):
             still_there = page.run_js("return !!document.querySelector('.swal-modal');")
             if not still_there:
                 break
             time.sleep(1)
 
-        # 关闭广告弹窗
         try:
             for selector in ['div.modal-content span.close', 'span.close', '.modal-content .close']:
                 btn = page.run_js(f"var btn = document.querySelector('{selector}'); if(btn && btn.offsetParent) {{ btn.click(); return true; }} return false;")
@@ -1257,11 +695,10 @@ def click_claim_coins(page, max_attempts=15):
 
 def main():
     success, claimed, total = False, 0, 0
-    cdk = ""
     total_balance = "未知"
 
     log("=" * 50)
-    log("🚀 启动：CDK 注入 + Bot-Hosting 金币领取 (DrissionPage)")
+    log("🚀 启动：Bot-Hosting 金币领取 (DrissionPage)")
     log(f"🖥️  运行模式: {'CI' if IS_CI else '本地'}")
     log("=" * 50)
 
@@ -1273,7 +710,7 @@ def main():
     co.set_argument('--window-size=1280,900')
     co.set_user_data_path(PROFILE_DIR)
 
-    # 加载 NopeCHA 扩展
+    # 保留 NopeCHA 扩展加载，前提是里面已经有可用的 key
     if os.path.isdir(NOPECHA_EXT_DIR):
         co.add_extension(NOPECHA_EXT_DIR)
         log(f"📦 加载扩展: {NOPECHA_EXT_DIR}")
@@ -1292,16 +729,7 @@ def main():
         return
 
     try:
-        # ── Step 1: 确保 CDK 有效并注入 ──────────────────
-        log("📂 打开 Discord 频道...")
-        page.get(DISCORD_CHANNEL_URL)
-        time.sleep(20)
-
-        cdk = ensure_cdk(page)
-        if not cdk:
-            return
-
-        # ── Step 2: 用 Discord OAuth 登录 bot-hosting ─────
+        # ── Step 1: 用 Discord OAuth 登录 bot-hosting ─────
         if not login_with_discord(page):
             msg = "❌ Discord OAuth 登录失败，无法进入面板"
             log(msg)
@@ -1353,15 +781,13 @@ def main():
         send_tg(
             f"✅ Bot-Hosting 金币领取完成\n"
             f"📊 本次进度: {claimed}/{total}\n"
-            f"💰 总金币余额: {total_balance}\n"
-            f"🔑 CDK: {cdk[:4]}****{cdk[-4:]}"
+            f"💰 总金币余额: {total_balance}"
         )
     else:
         send_tg(
             f"⚠️ Bot-Hosting 金币领取未完成\n"
             f"📊 本次进度: {claimed}/{total}\n"
-            f"💰 总金币余额: {total_balance}\n"
-            f"🔑 CDK: {cdk[:4]}****{cdk[-4:]}"
+            f"💰 总金币余额: {total_balance}"
         )
 
 
