@@ -432,9 +432,19 @@ def _click_authorize_btn(page):
     if rect.get('disabled'):
         log("  ⏳ 授权按钮 disabled，等待...")
         return False
+        
     if rect.get('w', 0) > 10:
         _cdp_click(page, int(rect['x']), int(rect['y']))
-    page.run_js(finder + " if (target) target.click();")
+        
+    try:
+        page.run_js(finder + " if (target) target.click();")
+    except Exception as e:
+        if 'The page is refreshed' in str(e) or 'disconnected' in str(e).lower():
+            # GitHub 环境网速太快，CDP点击后页面瞬间跳转会导致这里报 context 销毁错误，无视即可
+            pass
+        else:
+            log(f"  ⚠️ JS 点击兜底报错: {e}")
+            
     return True
 
 
