@@ -577,6 +577,11 @@ def do_signin(page, cdk):
     # 等待弹窗出现并处理
     time.sleep(3)
     dismiss_all_popups(page)
+    
+    # 【新增代码】强制刷新页面获取最新状态
+    log("  🔄 强制刷新页面获取最新状态...")
+    page.refresh()
+    time.sleep(5)
 
     # 等待并确认结果
     before_val = points_to_int(before_points)
