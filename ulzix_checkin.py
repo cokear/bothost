@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ulzix 每日签到 (DrissionPage + NopeCHA)
+Ulzix 每日签到 (DrissionPage + NopeCHA) 终极修复版
 ────────────────────────────────────────
-- 自动读取 NOPECHA_KEY 环境变量注入扩展（或使用现有配置）
-- DrissionPage 驱动浏览器
-- 自动登录 Ulzix + 签到 + 积分读取
-- Telegram 通知
+修复点：
+1. 消费 Token 后立即清空 `textarea`，彻底解决“连续弹出验证码时，脚本读取残留老 Token 导致抢跑”的问题。
+2. 点击“立即签到”后，强制等待后续弹出的九宫格（如有）被处理完毕，并留足 8 秒钟时间让签到 AJAX 请求完成，防止页面刷新阻断请求。
 """
 
 import os
 import re
 import sys
 import time
-import random
 import requests
 from DrissionPage import ChromiumPage, ChromiumOptions
 
@@ -35,7 +33,6 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
 SS_DIR = "screenshots"
 # ===========================================
-
 
 # ── 日志 & 通知 ───────────────────────────────────────────
 
@@ -232,7 +229,6 @@ def _cdp_click(page, vx, vy):
 
 
 def wait_for_cloudflare_cdp(page, timeout=90):
-    """CDP 点击方式过 Cloudflare（回退方案）"""
     start = time.time()
     click_count = 0
     while time.time() - start < timeout:
@@ -265,7 +261,6 @@ def wait_for_cloudflare_cdp(page, timeout=90):
 # ══════════════════════════════════════════════════════════
 
 def inject_cdk_to_extension(page, cdk):
-    """将 CDK 注入 NopeCHA 扩展（通过 setup 页面）"""
     if not cdk:
         return False
     log(f"💉 注入 API Key 到 NopeCHA 扩展: {cdk[:4]}****{cdk[-4:]}")
@@ -276,18 +271,27 @@ def inject_cdk_to_extension(page, cdk):
 
 
 def wait_hcaptcha_solved(page, timeout=60):
-    """等待 NopeCHA 扩展自动解完 hCaptcha（检查 response token 是否被填充）"""
+    """【核心修复】等待 Token，并消费后立刻清空 textarea！"""
     log("  ⏳ 等待 NopeCHA 扩展自动解 hCaptcha...")
     start = time.time()
     while time.time() - start < timeout:
         try:
             token = page.run_js("""
-                var ta = document.querySelector(
+                var tas = document.querySelectorAll(
                     'textarea[name="h-captcha-response"],'
                     + 'textarea[id*="h-captcha-response"],'
                     + 'textarea[data-hcaptcha-response]'
                 );
-                return (ta && ta.value && ta.value.length > 20) ? ta.value.substring(0, 30) : '';
+                for (var i = 0; i < tas.length; i++) {
+                    var ta = tas[i];
+                    if (ta && ta.value && ta.value.length > 20) {
+                        var val = ta.value;
+                        // 消费完毕后立即清空旧的值！绝对防止下一次死循环被旧 Token 骗过
+                        ta.value = '';
+                        return val.substring(0, 30);
+                    }
+                }
+                return '';
             """)
             if token:
                 log(f"  ✅ hCaptcha 已被扩展自动解决 (token: {token}...)")
@@ -300,7 +304,6 @@ def wait_hcaptcha_solved(page, timeout=60):
 
 
 def click_hcaptcha_checkbox(page):
-    """尝试点击 hCaptcha 复选框（扩展未自动解时的兜底）"""
     try:
         iframe = page.run_js("""
             var frames = document.querySelectorAll('iframe[src*="hcaptcha.com"]');
@@ -322,7 +325,6 @@ def click_hcaptcha_checkbox(page):
 
 
 def handle_captcha(page, cdk, scene="page", max_attempts=3):
-    """hCaptcha 处理：等待 NopeCHA 扩展自动解题"""
     log(f"  → [{scene}] 等待 hCaptcha 被扩展自动解决...")
 
     for attempt in range(max_attempts):
@@ -342,7 +344,6 @@ def handle_captcha(page, cdk, scene="page", max_attempts=3):
 # ══════════════════════════════════════════════════════════
 
 def ulzix_login(page, email, password, cdk):
-    """邮箱密码登录 Ulzix（可能触发 hCaptcha，用扩展解）"""
     log("🔐 登录 Ulzix...")
     page.get(LOGIN_URL)
     time.sleep(5)
@@ -353,7 +354,6 @@ def ulzix_login(page, email, password, cdk):
     time.sleep(3)
     save_screenshot(page, "01_login_loaded")
 
-    # 填写邮箱
     try:
         email_el = page.ele("css:#email", timeout=10)
         if email_el:
@@ -368,7 +368,6 @@ def ulzix_login(page, email, password, cdk):
 
     time.sleep(0.5)
 
-    # 填写密码
     try:
         pwd_el = page.ele("css:#password", timeout=5)
         if pwd_el:
@@ -384,7 +383,6 @@ def ulzix_login(page, email, password, cdk):
     time.sleep(0.5)
     save_screenshot(page, "02_form_filled")
 
-    # 提交
     try:
         submit = page.ele('css:button[type="submit"]', timeout=5)
         if submit:
@@ -396,7 +394,6 @@ def ulzix_login(page, email, password, cdk):
 
     time.sleep(6)
 
-    # 可能回调页有 CF
     if _is_cf_page(page) or _is_hcaptcha_page(page):
         handle_captcha(page, cdk, "login_callback")
 
@@ -416,7 +413,6 @@ def ulzix_login(page, email, password, cdk):
 # ══════════════════════════════════════════════════════════
 
 def _setup_dialog_handler(page):
-    """注册 JS 弹窗自动处理，防止 DrissionPage 崩溃"""
     try:
         page.run_js("""
             window.__dialogText = '';
@@ -448,15 +444,11 @@ def _setup_dialog_handler(page):
 
 
 def _dismiss_sweetalert(page):
-    """关闭 SweetAlert 弹窗（如果存在）"""
     try:
         page.run_js("""
-            // 方式1：swal.close()
             if (window.swal) { try { swal.close(); } catch(e) {} }
-            // 方式2：点击确认按钮
             var btn = document.querySelector('.swal-button.swal-button--confirm, .swal2-confirm');
             if (btn) btn.click();
-            // 方式3：点击关闭按钮
             var close = document.querySelector('.swal-button.swal-button--cancel, .swal2-close');
             if (close) close.click();
         """)
@@ -465,10 +457,8 @@ def _dismiss_sweetalert(page):
 
 
 def dismiss_all_popups(page):
-    """综合清理弹窗：JS alert + SweetAlert + 广告弹窗"""
     _dismiss_sweetalert(page)
     _setup_dialog_handler(page)
-    # 关闭常见广告弹窗
     try:
         page.run_js("""
             var closeBtns = document.querySelectorAll(
@@ -494,7 +484,6 @@ def points_to_int(value):
 
 
 def is_signed(html):
-    """判定是否已签到（文案驱动）"""
     if "今日还未签到" in html:
         return False
     if "签到成功" in html or "今日已签到" in html:
@@ -505,13 +494,11 @@ def is_signed(html):
 
 
 def do_signin(page, cdk):
-    """打开签到页 → 自动解 hCaptcha → 点签到 → 确认结果"""
     log("📝 打开签到页...")
     page.get(SIGNIN_URL)
     _setup_dialog_handler(page)
     time.sleep(10)
 
-    # 页面可能有 CF 或 hCaptcha
     if _is_cf_page(page) or _is_hcaptcha_page(page):
         log("  🔍 检测到验证码（CF/hCaptcha），尝试解决...")
         handle_captcha(page, cdk, "signin_page1")
@@ -522,12 +509,10 @@ def do_signin(page, cdk):
     html = page.run_js("return document.body.innerHTML;") or ""
     before_points = extract_points(html)
 
-    # 已签到
     if is_signed(html):
         log("  ℹ️ 今日已签到")
         return True, "今日已签到", before_points, before_points, None
 
-    # cookie 弹窗
     try:
         btn = page.ele('css:button.ncmp__btn', timeout=3)
         if btn:
@@ -537,17 +522,14 @@ def do_signin(page, cdk):
     except Exception:
         pass
 
-    # 签到页的 hCaptcha（签到按钮前可能有验证）
     if _is_cf_page(page) or _is_hcaptcha_page(page):
         log("  🔍 检测到验证码（CF/hCaptcha），尝试解决...")
         handle_captcha(page, cdk, "signin_page2")
 
-    # 再次确认 hCaptcha 已解决
     if _is_hcaptcha_page(page):
         log("  🔍 hCaptcha 仍存在，强制等待解决...")
         handle_captcha(page, cdk, "signin_before_click", max_attempts=5)
 
-    # 检查签到按钮
     try:
         btn = page.ele("css:#btn-signin", timeout=10)
         if not btn:
@@ -567,23 +549,29 @@ def do_signin(page, cdk):
 
         btn.click()
         log("  ✅ 已点击签到按钮")
-
-        # 立即注册弹窗处理器，防止后续弹窗导致崩溃
         _setup_dialog_handler(page)
     except Exception as e:
         log(f"  ⚠️ 签到按钮操作失败: {e}")
         return False, "签到失败", before_points, before_points, str(e)[:100]
 
-    # 等待弹窗出现并处理
+    # 【核心修复】点击按钮后，可能会触发九宫格验证，此处必须留足时间等待处理！
+    log("  🔍 检查点击签到后是否触发了新的验证码...")
     time.sleep(3)
+    if _is_hcaptcha_page(page) or _is_cf_page(page):
+        log("  ⚠️ 果然弹出了验证码！等待扩展火速破解...")
+        handle_captcha(page, cdk, "signin_post_click", max_attempts=5)
+    
+    # 哪怕没有弹出验证码，也要让子弹飞一会，等后台把 AJAX 请求彻底处理完
+    log("  ⏳ 正在等待服务器登记签到结果...")
+    time.sleep(8)
+    
+    # 最后清理一下可能的成功/失败弹窗
     dismiss_all_popups(page)
     
-    # 【新增代码】强制刷新页面获取最新状态
     log("  🔄 强制刷新页面获取最新状态...")
     page.refresh()
     time.sleep(5)
 
-    # 等待并确认结果
     before_val = points_to_int(before_points)
     for i in range(15):
         time.sleep(2)
@@ -591,14 +579,12 @@ def do_signin(page, cdk):
         current_points = extract_points(html)
         current_val = points_to_int(current_points)
 
-        # 积分增加 = 成功
         if (before_val is not None and current_val is not None
                 and current_val > before_val):
             log(f"  ✅ 签到成功！积分: {before_points} → {current_points}")
             save_screenshot(page, "05_signin_success")
             return True, "签到成功", before_points, current_points, None
 
-        # 文案兜底
         if is_signed(html):
             log(f"  ✅ 文案确认签到成功，积分: {current_points}")
             save_screenshot(page, "05_signin_success")
@@ -653,7 +639,6 @@ def main():
     log("🚀 Ulzix 每日签到 (DrissionPage + NopeCHA)")
     log("=" * 50)
 
-    # ── 启动浏览器 ──────────────────────────────────────
     co = ChromiumOptions()
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-dev-shm-usage')
@@ -661,7 +646,6 @@ def main():
     co.set_argument('--window-size=1280,900')
     co.set_user_data_path(PROFILE_DIR)
 
-    # 加载 NopeCHA 扩展
     if os.path.isdir(NOPECHA_EXT_DIR):
         co.add_extension(NOPECHA_EXT_DIR)
         log(f"📦 加载扩展: {NOPECHA_EXT_DIR}")
@@ -687,10 +671,8 @@ def main():
     cdk = ""
 
     try:
-        # 提前注册弹窗处理器
         _setup_dialog_handler(page)
 
-        # ── 检查环境变量中的 API Key 并注入 ──
         cdk = os.getenv("NOPECHA_KEY", "")
         if cdk:
             log(f"🔑 检测到环境变量 NOPECHA_KEY，准备注入扩展...")
@@ -698,7 +680,6 @@ def main():
         else:
             log("ℹ️ 未检测到 NOPECHA_KEY 环境变量，假设浏览器配置中已填写 API Key")
 
-        # ── Step 1: 登录 Ulzix ──
         ok, reason = ulzix_login(page, email, password, cdk)
         if not ok:
             fail_reason = reason
@@ -706,11 +687,9 @@ def main():
             send_tg(build_result_caption(email, "登录失败", fail_reason=reason))
             return False
 
-        # ── Step 2: 签到 ──
         success, result_text, before_points, current_points, fail_reason = \
             do_signin(page, cdk)
 
-        # ── 通知 ──
         caption = build_result_caption(
             email, result_text, before_points, current_points, fail_reason
         )
